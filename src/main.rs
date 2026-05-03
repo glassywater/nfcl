@@ -143,6 +143,15 @@ fn run() -> Result<()> {
         return bail("bucket cache JSON must differ from config and installed JSON paths");
     }
 
+    // `init` is the only command that may run without an existing config
+    // directory — its job is to create it. For every other invocation
+    // (including `help`, `--help`, no args, and unknown commands) we
+    // require ~/.config/fontctl/ to exist and prompt for `--init` if not.
+    let is_init = args.first().map(String::as_str) == Some("init");
+    if !is_init {
+        require_config_dir(&options)?;
+    }
+
     if args.is_empty() {
         print_help();
         return Ok(());
@@ -153,7 +162,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if matches!(args[0].as_str(), "init") {
+    if is_init {
         cmd_init(&mut options, &args[1..])?;
         return Ok(());
     }
@@ -177,6 +186,21 @@ fn run() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn require_config_dir(options: &Options) -> Result<()> {
+    let config_dir = options
+        .config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    if !config_dir.is_dir() {
+        return bail(format!(
+            "{APP_NAME} config directory not found: {}. Run '{APP_NAME} --init' first.",
+            config_dir.display()
+        ));
+    }
     Ok(())
 }
 
@@ -349,19 +373,9 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
 }
 
 fn ensure_initialized(options: &mut Options) -> Result<()> {
-    let config_dir = options
-        .config_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    if !config_dir.is_dir() {
-        return bail(format!(
-            "{APP_NAME} config directory not found: {}. Run '{APP_NAME} --init' first.",
-            config_dir.display()
-        ));
-    }
-
+    // The config directory existence is checked once up front in `run()` for
+    // every non-init command, so by the time we get here the directory is
+    // guaranteed to exist; only the file itself still needs verifying.
     if !options.config_path.exists() {
         return bail(format!(
             "{APP_NAME} is not initialized. Run '{APP_NAME} --init' first. Expected config: {}",

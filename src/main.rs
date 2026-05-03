@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 const APP_NAME: &str = "fontctl";
 const CONFIG_VERSION: u32 = 1;
 const DEFAULT_REPO: &str = "/home/Kyecox/work/font/scoop-nerd-fonts";
@@ -893,11 +895,28 @@ impl Manifest {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ManifestRaw {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_license")]
+    license: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_array")]
+    url: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_array")]
+    hash: Vec<String>,
+    #[serde(default)]
+    extract_dir: Option<String>,
+}
+
 fn read_manifest(path: &Path) -> Result<Manifest> {
     let text = fs::read_to_string(path)?;
-    let json = parse_json(&text)?;
-    let object = json.as_object().ok_or_else(|| {
-        CliError::new(format!("manifest is not a JSON object: {}", path.display()))
+    let raw: ManifestRaw = serde_json::from_str(&text).map_err(|err| {
+        CliError::new(format!("invalid manifest {}: {err}", path.display()))
     })?;
 
     let name = path
@@ -905,21 +924,21 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
         .and_then(|value| value.to_str())
         .ok_or_else(|| CliError::new(format!("invalid manifest path: {}", path.display())))?
         .to_string();
-    let urls = json_string_or_array(object.get("url"))
-        .ok_or_else(|| CliError::new(format!("manifest missing url: {}", path.display())))?;
-    let hash_values = json_string_or_array(object.get("hash")).unwrap_or_default();
-    let hashes = normalize_hashes(urls.len(), hash_values);
+    if raw.url.is_empty() {
+        return bail(format!("manifest missing url: {}", path.display()));
+    }
+    let hashes = normalize_hashes(raw.url.len(), raw.hash);
 
     Ok(Manifest {
         name,
         path: path.to_path_buf(),
-        version: json_string(object.get("version")),
-        description: json_string(object.get("description")),
-        homepage: json_string(object.get("homepage")),
-        license: json_string(object.get("license")),
-        urls,
+        version: raw.version,
+        description: raw.description,
+        homepage: raw.homepage,
+        license: raw.license,
+        urls: raw.url,
         hashes,
-        extract_dir: json_string(object.get("extract_dir")),
+        extract_dir: raw.extract_dir,
     })
 }
 
@@ -940,156 +959,175 @@ fn normalize_hashes(url_len: usize, values: Vec<String>) -> Vec<Option<String>> 
         .collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct CliConfig {
+    #[serde(default)]
     repo_dir: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct InstalledFile {
+    #[serde(default = "unknown_version", deserialize_with = "deserialize_string_lenient")]
     version: String,
+    #[serde(default)]
     installed: BTreeMap<String, InstalledFont>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct InstalledFont {
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     version: String,
+    #[serde(default)]
     manifest: String,
+    #[serde(default)]
     urls: Vec<String>,
+    #[serde(default)]
     hashes: Vec<String>,
+    #[serde(default)]
     installed_at: String,
+    #[serde(default)]
     font_dir: String,
+    #[serde(default)]
     files: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct BucketCache {
+    #[serde(default = "unknown_version")]
     version: String,
+    #[serde(default, rename = "bucket")]
     fonts: BTreeMap<String, CachedFont>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct CachedFont {
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     version: String,
+    #[serde(default)]
     description: String,
+    #[serde(default)]
     homepage: String,
+    #[serde(default)]
     license: String,
+    #[serde(default)]
     extract_dir: String,
+    #[serde(default)]
     urls: Vec<String>,
+    #[serde(default)]
     hashes: Vec<String>,
+    #[serde(default)]
     manifest: String,
+}
+
+fn unknown_version() -> String {
+    "unknown".to_string()
+}
+
+/// Manifest `url` / `hash` may be either a plain string or an array; flatten
+/// both into `Vec<String>`.
+fn deserialize_string_or_array<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// Accept the legacy `"version": <number>` shape that older fontctl builds
+/// wrote into installed.json before we switched to git versions.
+fn deserialize_string_lenient<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => String::new(),
+        _ => String::new(),
+    })
+}
+
+/// Scoop manifests sometimes write `license` as an object
+/// `{"identifier":"MIT","url":"..."}` rather than a plain string. Pull
+/// the identifier out so we still surface something useful.
+fn deserialize_license<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Object(map)) => map
+            .get("identifier")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
+        _ => None,
+    })
 }
 
 fn load_config(path: &Path) -> Result<CliConfig> {
     if !path.exists() {
         return Ok(CliConfig { repo_dir: None });
     }
-
     let text = fs::read_to_string(path)?;
-    let json = parse_json(&text)?;
-    let object = json
-        .as_object()
-        .ok_or_else(|| CliError::new(format!("config is not a JSON object: {}", path.display())))?;
-
-    Ok(CliConfig {
-        repo_dir: json_string(object.get("repo_dir")),
-    })
+    serde_json::from_str(&text)
+        .map_err(|err| CliError::new(format!("invalid config {}: {err}", path.display())))
 }
 
 fn save_config(path: &Path, config: &CliConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    let mut out = String::new();
-    out.push_str("{\n");
-    out.push_str(&format!("  \"version\": {CONFIG_VERSION},\n"));
-    push_json_string_field(
-        &mut out,
-        "repo_dir",
-        config.repo_dir.as_deref().unwrap_or(DEFAULT_REPO),
-        2,
-        true,
-    );
-    push_json_string_field(&mut out, "remote", DEFAULT_REMOTE, 2, false);
-    out.push_str("}\n");
-    fs::write(path, out)?;
+    let value = serde_json::json!({
+        "version": CONFIG_VERSION,
+        "repo_dir": config.repo_dir.as_deref().unwrap_or(DEFAULT_REPO),
+        "remote": DEFAULT_REMOTE,
+    });
+    let mut text = serde_json::to_string_pretty(&value)
+        .map_err(|err| CliError::new(format!("config serialize: {err}")))?;
+    text.push('\n');
+    fs::write(path, text)?;
     Ok(())
 }
 
 fn load_installed(path: &Path) -> Result<InstalledFile> {
     if !path.exists() {
         return Ok(InstalledFile {
-            version: "unknown".to_string(),
+            version: unknown_version(),
             installed: BTreeMap::new(),
         });
     }
-
     let text = fs::read_to_string(path)?;
-    let json = parse_json(&text)?;
-    let object = json.as_object().ok_or_else(|| {
-        CliError::new(format!(
-            "installed JSON is not a JSON object: {}",
-            path.display()
-        ))
-    })?;
-    let version = json_string(object.get("version")).unwrap_or_else(|| "unknown".to_string());
-    let mut installed = BTreeMap::new();
-
-    if let Some(installed_obj) = object.get("installed").and_then(Json::as_object) {
-        for (key, value) in installed_obj {
-            let Some(record_obj) = value.as_object() else {
-                continue;
-            };
-            let name = json_string(record_obj.get("name")).unwrap_or_else(|| key.clone());
-            let record = InstalledFont {
-                name: name.clone(),
-                version: json_string(record_obj.get("version"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                manifest: json_string(record_obj.get("manifest")).unwrap_or_default(),
-                urls: json_string_or_array(record_obj.get("urls")).unwrap_or_default(),
-                hashes: json_string_or_array(record_obj.get("hashes")).unwrap_or_default(),
-                installed_at: json_string(record_obj.get("installed_at")).unwrap_or_default(),
-                font_dir: json_string(record_obj.get("font_dir")).unwrap_or_default(),
-                files: json_string_or_array(record_obj.get("files")).unwrap_or_default(),
-            };
-            installed.insert(name, record);
-        }
-    }
-
-    Ok(InstalledFile { version, installed })
+    serde_json::from_str(&text)
+        .map_err(|err| CliError::new(format!("invalid installed JSON {}: {err}", path.display())))
 }
 
 fn save_installed(path: &Path, config: &InstalledFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    let mut out = String::new();
-    out.push_str("{\n");
-    push_json_string_field(&mut out, "version", &config.version, 2, true);
-    out.push_str("  \"installed\": {\n");
-    for (idx, (key, record)) in config.installed.iter().enumerate() {
-        out.push_str(&format!("    \"{}\": {{\n", json_escape(key)));
-        push_json_string_field(&mut out, "name", &record.name, 6, true);
-        push_json_string_field(&mut out, "version", &record.version, 6, true);
-        push_json_string_field(&mut out, "manifest", &record.manifest, 6, true);
-        push_json_array_field(&mut out, "urls", &record.urls, 6, true);
-        push_json_array_field(&mut out, "hashes", &record.hashes, 6, true);
-        push_json_string_field(&mut out, "installed_at", &record.installed_at, 6, true);
-        push_json_string_field(&mut out, "font_dir", &record.font_dir, 6, true);
-        push_json_array_field(&mut out, "files", &record.files, 6, false);
-        if idx + 1 == config.installed.len() {
-            out.push_str("    }\n");
-        } else {
-            out.push_str("    },\n");
-        }
-    }
-    out.push_str("  }\n");
-    out.push_str("}\n");
-    fs::write(path, out)?;
+    let mut text = serde_json::to_string_pretty(config)
+        .map_err(|err| CliError::new(format!("installed serialize: {err}")))?;
+    text.push('\n');
+    fs::write(path, text)?;
     Ok(())
 }
 
@@ -1134,76 +1172,23 @@ fn save_bucket_cache(path: &Path, cache: &BucketCache) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    let mut out = String::new();
-    out.push_str("{\n");
-    push_json_string_field(&mut out, "version", &cache.version, 2, true);
-    out.push_str("  \"bucket\": {\n");
-    let total = cache.fonts.len();
-    for (idx, (key, font)) in cache.fonts.iter().enumerate() {
-        out.push_str(&format!("    \"{}\": {{\n", json_escape(key)));
-        push_json_string_field(&mut out, "name", &font.name, 6, true);
-        push_json_string_field(&mut out, "version", &font.version, 6, true);
-        push_json_string_field(&mut out, "description", &font.description, 6, true);
-        push_json_string_field(&mut out, "homepage", &font.homepage, 6, true);
-        push_json_string_field(&mut out, "license", &font.license, 6, true);
-        push_json_string_field(&mut out, "extract_dir", &font.extract_dir, 6, true);
-        push_json_array_field(&mut out, "urls", &font.urls, 6, true);
-        push_json_array_field(&mut out, "hashes", &font.hashes, 6, true);
-        push_json_string_field(&mut out, "manifest", &font.manifest, 6, false);
-        if idx + 1 == total {
-            out.push_str("    }\n");
-        } else {
-            out.push_str("    },\n");
-        }
-    }
-    out.push_str("  }\n");
-    out.push_str("}\n");
-    fs::write(path, out)?;
+    let mut text = serde_json::to_string_pretty(cache)
+        .map_err(|err| CliError::new(format!("bucket cache serialize: {err}")))?;
+    text.push('\n');
+    fs::write(path, text)?;
     Ok(())
 }
 
 fn load_bucket_cache(path: &Path) -> Result<BucketCache> {
     if !path.exists() {
         return Ok(BucketCache {
-            version: "unknown".to_string(),
+            version: unknown_version(),
             fonts: BTreeMap::new(),
         });
     }
-
     let text = fs::read_to_string(path)?;
-    let json = parse_json(&text)?;
-    let object = json.as_object().ok_or_else(|| {
-        CliError::new(format!(
-            "bucket cache is not a JSON object: {}",
-            path.display()
-        ))
-    })?;
-    let version = json_string(object.get("version")).unwrap_or_else(|| "unknown".to_string());
-    let mut fonts = BTreeMap::new();
-
-    if let Some(bucket_obj) = object.get("bucket").and_then(Json::as_object) {
-        for (key, value) in bucket_obj {
-            let Some(record_obj) = value.as_object() else {
-                continue;
-            };
-            let name = json_string(record_obj.get("name")).unwrap_or_else(|| key.clone());
-            let cached = CachedFont {
-                name: name.clone(),
-                version: json_string(record_obj.get("version")).unwrap_or_default(),
-                description: json_string(record_obj.get("description")).unwrap_or_default(),
-                homepage: json_string(record_obj.get("homepage")).unwrap_or_default(),
-                license: json_string(record_obj.get("license")).unwrap_or_default(),
-                extract_dir: json_string(record_obj.get("extract_dir")).unwrap_or_default(),
-                urls: json_string_or_array(record_obj.get("urls")).unwrap_or_default(),
-                hashes: json_string_or_array(record_obj.get("hashes")).unwrap_or_default(),
-                manifest: json_string(record_obj.get("manifest")).unwrap_or_default(),
-            };
-            fonts.insert(name, cached);
-        }
-    }
-
-    Ok(BucketCache { version, fonts })
+    serde_json::from_str(&text)
+        .map_err(|err| CliError::new(format!("invalid bucket cache {}: {err}", path.display())))
 }
 
 /// Rebuild the bucket cache only when the repo bucket directory exists yet.
@@ -1221,41 +1206,6 @@ fn build_and_save_bucket_cache(options: &Options) -> Result<BucketCache> {
     let cache = build_bucket_cache(&options.bucket_dir, &options.repo_dir)?;
     save_bucket_cache(&options.bucket_cache_path, &cache)?;
     Ok(cache)
-}
-
-fn push_json_string_field(out: &mut String, key: &str, value: &str, indent: usize, comma: bool) {
-    out.push_str(&" ".repeat(indent));
-    out.push_str(&format!(
-        "\"{}\": \"{}\"",
-        json_escape(key),
-        json_escape(value)
-    ));
-    if comma {
-        out.push(',');
-    }
-    out.push('\n');
-}
-
-fn push_json_array_field(
-    out: &mut String,
-    key: &str,
-    values: &[String],
-    indent: usize,
-    comma: bool,
-) {
-    out.push_str(&" ".repeat(indent));
-    out.push_str(&format!("\"{}\": [", json_escape(key)));
-    for (idx, value) in values.iter().enumerate() {
-        if idx > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&format!("\"{}\"", json_escape(value)));
-    }
-    out.push(']');
-    if comma {
-        out.push(',');
-    }
-    out.push('\n');
 }
 
 fn install_by_query(options: &Options, query: &str, force: bool) -> Result<InstalledFont> {
@@ -1886,273 +1836,51 @@ fn now_unix_seconds() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-fn json_string(value: Option<&Json>) -> Option<String> {
-    value.and_then(Json::as_str).map(ToOwned::to_owned)
-}
-
-fn json_string_or_array(value: Option<&Json>) -> Option<Vec<String>> {
-    match value? {
-        Json::String(value) => Some(vec![value.clone()]),
-        Json::Array(values) => Some(
-            values
-                .iter()
-                .filter_map(Json::as_str)
-                .map(ToOwned::to_owned)
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
-fn json_escape(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Json {
-    Null,
-    Bool(()),
-    Number(()),
-    String(String),
-    Array(Vec<Json>),
-    Object(BTreeMap<String, Json>),
-}
-
-impl Json {
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            Json::String(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    fn as_object(&self) -> Option<&BTreeMap<String, Json>> {
-        match self {
-            Json::Object(value) => Some(value),
-            _ => None,
-        }
-    }
-}
-
-fn parse_json(input: &str) -> Result<Json> {
-    let mut parser = JsonParser {
-        chars: input.chars().collect(),
-        pos: 0,
-    };
-    let value = parser.parse_value()?;
-    parser.skip_ws();
-    if !parser.is_eof() {
-        return bail("trailing content after JSON value");
-    }
-    Ok(value)
-}
-
-struct JsonParser {
-    chars: Vec<char>,
-    pos: usize,
-}
-
-impl JsonParser {
-    fn parse_value(&mut self) -> Result<Json> {
-        self.skip_ws();
-        match self.peek() {
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
-            Some('"') => self.parse_string().map(Json::String),
-            Some('t') => {
-                self.expect_literal("true")?;
-                Ok(Json::Bool(()))
-            }
-            Some('f') => {
-                self.expect_literal("false")?;
-                Ok(Json::Bool(()))
-            }
-            Some('n') => {
-                self.expect_literal("null")?;
-                Ok(Json::Null)
-            }
-            Some(ch) if ch == '-' || ch.is_ascii_digit() => self.parse_number(),
-            Some(ch) => bail(format!("unexpected JSON character '{ch}'")),
-            None => bail("unexpected end of JSON"),
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<Json> {
-        self.expect('{')?;
-        let mut object = BTreeMap::new();
-        self.skip_ws();
-        if self.consume('}') {
-            return Ok(Json::Object(object));
-        }
-
-        loop {
-            self.skip_ws();
-            let key = self.parse_string()?;
-            self.skip_ws();
-            self.expect(':')?;
-            let value = self.parse_value()?;
-            object.insert(key, value);
-            self.skip_ws();
-            if self.consume('}') {
-                break;
-            }
-            self.expect(',')?;
-        }
-
-        Ok(Json::Object(object))
-    }
-
-    fn parse_array(&mut self) -> Result<Json> {
-        self.expect('[')?;
-        let mut array = Vec::new();
-        self.skip_ws();
-        if self.consume(']') {
-            return Ok(Json::Array(array));
-        }
-
-        loop {
-            array.push(self.parse_value()?);
-            self.skip_ws();
-            if self.consume(']') {
-                break;
-            }
-            self.expect(',')?;
-        }
-
-        Ok(Json::Array(array))
-    }
-
-    fn parse_string(&mut self) -> Result<String> {
-        self.expect('"')?;
-        let mut out = String::new();
-        loop {
-            let Some(ch) = self.bump() else {
-                return bail("unterminated JSON string");
-            };
-            match ch {
-                '"' => break,
-                '\\' => {
-                    let Some(escaped) = self.bump() else {
-                        return bail("unterminated JSON escape");
-                    };
-                    match escaped {
-                        '"' => out.push('"'),
-                        '\\' => out.push('\\'),
-                        '/' => out.push('/'),
-                        'b' => out.push('\u{0008}'),
-                        'f' => out.push('\u{000c}'),
-                        'n' => out.push('\n'),
-                        'r' => out.push('\r'),
-                        't' => out.push('\t'),
-                        'u' => out.push(self.parse_unicode_escape()?),
-                        other => return bail(format!("invalid JSON escape '\\{other}'")),
-                    }
-                }
-                ch => out.push(ch),
-            }
-        }
-        Ok(out)
-    }
-
-    fn parse_unicode_escape(&mut self) -> Result<char> {
-        let mut value = 0u32;
-        for _ in 0..4 {
-            let Some(ch) = self.bump() else {
-                return bail("unterminated unicode escape");
-            };
-            value = value * 16
-                + ch.to_digit(16)
-                    .ok_or_else(|| CliError::new(format!("invalid unicode escape digit '{ch}'")))?;
-        }
-        Ok(char::from_u32(value).unwrap_or('\u{fffd}'))
-    }
-
-    fn parse_number(&mut self) -> Result<Json> {
-        let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | 'e' | 'E') {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return bail("expected JSON number");
-        }
-        Ok(Json::Number(()))
-    }
-
-    fn expect_literal(&mut self, literal: &str) -> Result<()> {
-        for expected in literal.chars() {
-            self.expect(expected)?;
-        }
-        Ok(())
-    }
-
-    fn expect(&mut self, expected: char) -> Result<()> {
-        match self.bump() {
-            Some(ch) if ch == expected => Ok(()),
-            Some(ch) => bail(format!("expected '{expected}', got '{ch}'")),
-            None => bail(format!("expected '{expected}', got end of JSON")),
-        }
-    }
-
-    fn consume(&mut self, expected: char) -> bool {
-        if self.peek() == Some(expected) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn skip_ws(&mut self) {
-        while self.peek().map(|ch| ch.is_whitespace()).unwrap_or(false) {
-            self.pos += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let ch = self.peek()?;
-        self.pos += 1;
-        Some(ch)
-    }
-
-    fn is_eof(&self) -> bool {
-        self.pos >= self.chars.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn json_parser_reads_manifest_shape() {
-        let json = parse_json(
+    fn manifest_raw_deserializes_string_or_array() {
+        let raw: ManifestRaw = serde_json::from_str(
             r#"{"version":"1","url":["a.ttf","b.ttf"],"hash":["aa","bb"],"extract_dir":"ttf"}"#,
         )
         .unwrap();
-        let object = json.as_object().unwrap();
-        assert_eq!(json_string(object.get("version")).unwrap(), "1");
-        assert_eq!(json_string_or_array(object.get("url")).unwrap().len(), 2);
-        assert_eq!(json_string(object.get("extract_dir")).unwrap(), "ttf");
+        assert_eq!(raw.version.as_deref(), Some("1"));
+        assert_eq!(raw.url, vec!["a.ttf".to_string(), "b.ttf".to_string()]);
+        assert_eq!(raw.hash, vec!["aa".to_string(), "bb".to_string()]);
+        assert_eq!(raw.extract_dir.as_deref(), Some("ttf"));
+
+        let single: ManifestRaw =
+            serde_json::from_str(r#"{"url":"only.ttf","hash":"single"}"#).unwrap();
+        assert_eq!(single.url, vec!["only.ttf".to_string()]);
+        assert_eq!(single.hash, vec!["single".to_string()]);
+    }
+
+    #[test]
+    fn manifest_raw_accepts_object_license() {
+        let raw: ManifestRaw = serde_json::from_str(
+            r#"{"license":{"identifier":"OFL-1.1","url":"https://example.com/license"},"url":"x.zip"}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.license.as_deref(), Some("OFL-1.1"));
+
+        let plain: ManifestRaw =
+            serde_json::from_str(r#"{"license":"MIT","url":"x.zip"}"#).unwrap();
+        assert_eq!(plain.license.as_deref(), Some("MIT"));
+
+        let missing: ManifestRaw = serde_json::from_str(r#"{"url":"x.zip"}"#).unwrap();
+        assert!(missing.license.is_none());
+    }
+
+    #[test]
+    fn installed_file_accepts_legacy_numeric_version() {
+        // older fontctl wrote "version": 1 (number); we now expect a string,
+        // but should still load the file rather than fail outright.
+        let installed: InstalledFile =
+            serde_json::from_str(r#"{"version": 1, "installed": {}}"#).unwrap();
+        assert_eq!(installed.version, "1");
+        assert!(installed.installed.is_empty());
     }
 
     #[test]

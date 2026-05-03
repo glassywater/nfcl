@@ -64,6 +64,7 @@ struct Options {
     bucket_overridden: bool,
     installed_overridden: bool,
     bucket_cache_overridden: bool,
+    cache_dir_overridden: bool,
 }
 
 impl Options {
@@ -102,7 +103,9 @@ impl Options {
                 .join("fonts")
                 .join(APP_NAME)
         });
-        let cache_dir = env_path("FONTCTL_CACHE_DIR").unwrap_or_else(|| {
+        let cache_env = env_path("FONTCTL_CACHE_DIR");
+        let cache_dir_overridden = cache_env.is_some();
+        let cache_dir = cache_env.unwrap_or_else(|| {
             xdg_cache_home()
                 .unwrap_or_else(|| home_dir().join(".cache"))
                 .join(APP_NAME)
@@ -120,6 +123,7 @@ impl Options {
             bucket_overridden,
             installed_overridden,
             bucket_cache_overridden,
+            cache_dir_overridden,
         })
     }
 }
@@ -179,6 +183,7 @@ fn run() -> Result<()> {
         "update" | "pudate" => cmd_update(&mut options, &args[1..])?,
         "config" => cmd_config(&options)?,
         "doctor" => cmd_doctor(&options)?,
+        "cache" => cmd_cache(&options, &args[1..])?,
         command => {
             return bail(format!(
                 "unknown command '{command}'. Run '{APP_NAME} help' for usage."
@@ -273,6 +278,7 @@ fn parse_global_args(raw: Vec<String>, options: &mut Options) -> Result<Vec<Stri
                     .get(i)
                     .ok_or_else(|| CliError::new("--cache-dir requires a path"))?;
                 options.cache_dir = PathBuf::from(value);
+                options.cache_dir_overridden = true;
             }
             _ => args.push(raw[i].clone()),
         }
@@ -299,6 +305,8 @@ Commands:
   uninstall <font>          Remove a font installed by this CLI
   installed                 Show fonts recorded in config JSON
   update [--install]        git pull/clone manifests, then compare installed versions
+  cache list                List archives kept in the download cache
+  cache rm <font>|--all     Drop a single cached archive or wipe the whole cache
   config                    Print paths used by the CLI
   doctor                    Check local tools and paths
 
@@ -323,6 +331,21 @@ Defaults:
 
 fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
     let mut config = load_config(&options.config_path)?;
+
+    // Preserve any cache_dir the user has previously persisted (or hand-edited
+    // into config.json), unless this invocation explicitly overrode it via
+    // --cache-dir / FONTCTL_CACHE_DIR.
+    if !options.cache_dir_overridden {
+        if let Some(saved) = config
+            .cache_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            options.cache_dir = expand_home(saved);
+        }
+    }
+
     let installed_to_create = if options.installed_path.exists() {
         None
     } else {
@@ -349,6 +372,7 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
     }
 
     config.repo_dir = Some(options.repo_dir.to_string_lossy().to_string());
+    config.cache_dir = Some(options.cache_dir.to_string_lossy().to_string());
     save_config(&options.config_path, &config)?;
     if let Some(mut installed) = installed_to_create {
         installed.version = repo_version_or_unknown(&options.repo_dir);
@@ -361,6 +385,7 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
     println!("Installed JSON: {}", options.installed_path.display());
     println!("Bucket cache:   {}", options.bucket_cache_path.display());
     println!("Repo:           {}", options.repo_dir.display());
+    println!("Cache dir:      {}", options.cache_dir.display());
     if !cache_built {
         println!(
             "Bucket directory not found yet; run '{APP_NAME} update' to clone the repo and build the bucket cache."
@@ -400,6 +425,25 @@ fn ensure_initialized(options: &mut Options) -> Result<()> {
     }
     if !options.bucket_overridden {
         options.bucket_dir = options.repo_dir.join("bucket");
+    }
+    if !options.cache_dir_overridden {
+        if let Some(cache) = config
+            .cache_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            options.cache_dir = expand_home(cache);
+        }
+    }
+
+    // Lazy migration: if the on-disk config predates the cache_dir field,
+    // snapshot the current resolution into config.json so it shows up on
+    // future inspections and so users can edit one file to relocate it.
+    if config.cache_dir.is_none() {
+        let mut migrated = config;
+        migrated.cache_dir = Some(options.cache_dir.to_string_lossy().to_string());
+        save_config(&options.config_path, &migrated)?;
     }
 
     Ok(())
@@ -714,6 +758,230 @@ fn cmd_doctor(options: &Options) -> Result<()> {
     Ok(())
 }
 
+fn cmd_cache(options: &Options, args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("list") | Some("ls") => cmd_cache_list(options),
+        Some("rm") | Some("clean") | Some("clear") => cmd_cache_rm(options, &args[1..]),
+        Some(other) => bail(format!(
+            "unknown cache subcommand '{other}'. Try 'cache list' or 'cache rm <name>|--all'."
+        )),
+        None => bail("cache requires a subcommand: list, rm"),
+    }
+}
+
+fn cmd_cache_list(options: &Options) -> Result<()> {
+    let downloads_dir = options.cache_dir.join("downloads");
+    let work_dir = options.cache_dir.join("work");
+
+    let mut entries: BTreeMap<String, (u64, Vec<String>, bool)> = BTreeMap::new();
+    if downloads_dir.is_dir() {
+        for entry in fs::read_dir(&downloads_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let mut size = 0u64;
+            let mut files = Vec::new();
+            for f in fs::read_dir(&path)? {
+                let f = f?;
+                let p = f.path();
+                if p.is_file() {
+                    size += p.metadata()?.len();
+                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                        files.push(name.to_string());
+                    }
+                }
+            }
+            files.sort();
+            entries.insert(name, (size, files, false));
+        }
+    }
+    if work_dir.is_dir() {
+        for entry in fs::read_dir(&work_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                entries
+                    .entry(name.to_string())
+                    .or_insert_with(|| (0, Vec::new(), false))
+                    .2 = true;
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        println!("Cache is empty ({}).", options.cache_dir.display());
+        return Ok(());
+    }
+
+    let mut total = 0u64;
+    for (name, (size, files, has_work)) in &entries {
+        total += size;
+        let work_marker = if *has_work { " [+work]" } else { "" };
+        let archives = if files.is_empty() {
+            "(no archives)".to_string()
+        } else {
+            files.join(", ")
+        };
+        println!(
+            "{name}{work_marker}  {}  {archives}",
+            format_size(*size)
+        );
+    }
+    println!("---");
+    println!(
+        "{} cache entr{}, {} total",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        format_size(total)
+    );
+    Ok(())
+}
+
+fn cmd_cache_rm(options: &Options, args: &[String]) -> Result<()> {
+    let all = args.iter().any(|a| a == "--all");
+    let positional: Vec<&str> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(|a| a.as_str())
+        .collect();
+
+    let downloads_dir = options.cache_dir.join("downloads");
+    let work_dir = options.cache_dir.join("work");
+
+    if all {
+        if !positional.is_empty() {
+            return bail("cache rm: --all and <name> are mutually exclusive");
+        }
+        let mut freed = 0u64;
+        let mut removed_any = false;
+        for sub in [&downloads_dir, &work_dir] {
+            if sub.is_dir() {
+                freed += dir_size(sub).unwrap_or(0);
+                fs::remove_dir_all(sub)?;
+                removed_any = true;
+            }
+        }
+        if !removed_any {
+            println!("Cache was already empty.");
+        } else {
+            println!("Cleared cache ({} freed).", format_size(freed));
+        }
+        return Ok(());
+    }
+
+    if positional.is_empty() {
+        return bail("cache rm requires a font name or --all");
+    }
+
+    let mut total_freed = 0u64;
+    let mut removed = 0usize;
+    for query in positional {
+        let mut hit = false;
+        let mut entry_freed = 0u64;
+        let mut display_name = query.to_string();
+        for sub in [&downloads_dir, &work_dir] {
+            if let Some(actual) = resolve_cache_name(sub, query) {
+                display_name = actual.clone();
+                let target = sub.join(&actual);
+                let size = dir_size(&target).unwrap_or(0);
+                fs::remove_dir_all(&target)?;
+                entry_freed += size;
+                hit = true;
+            }
+        }
+        if hit {
+            removed += 1;
+            total_freed += entry_freed;
+            println!("Removed {display_name} ({} freed)", format_size(entry_freed));
+        } else {
+            eprintln!("warning: no cache entry for '{query}'");
+        }
+    }
+
+    if removed > 0 {
+        println!("---");
+        println!(
+            "Removed {removed} entr{}, {} freed",
+            if removed == 1 { "y" } else { "ies" },
+            format_size(total_freed)
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a user-supplied cache name to an actual on-disk subdirectory under
+/// `parent`. Tries exact match first, then case-insensitive. Returns the
+/// real on-disk name, so callers can both report and `remove_dir_all` it.
+fn resolve_cache_name(parent: &Path, query: &str) -> Option<String> {
+    if !parent.is_dir() {
+        return None;
+    }
+    if parent.join(query).is_dir() {
+        return Some(query.to_string());
+    }
+    let q_lower = query.to_lowercase();
+    let entries = fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if name.to_lowercase() == q_lower {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn dir_size(path: &Path) -> Result<u64> {
+    if path.is_file() {
+        return Ok(path.metadata()?.len());
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_dir() {
+            total += dir_size(&p)?;
+        } else if let Ok(meta) = p.metadata() {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BucketEntry {
     name: String,
@@ -977,6 +1245,8 @@ fn normalize_hashes(url_len: usize, values: Vec<String>) -> Vec<Option<String>> 
 struct CliConfig {
     #[serde(default)]
     repo_dir: Option<String>,
+    #[serde(default)]
+    cache_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1099,7 +1369,10 @@ where
 
 fn load_config(path: &Path) -> Result<CliConfig> {
     if !path.exists() {
-        return Ok(CliConfig { repo_dir: None });
+        return Ok(CliConfig {
+            repo_dir: None,
+            cache_dir: None,
+        });
     }
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text)
@@ -1110,12 +1383,29 @@ fn save_config(path: &Path, config: &CliConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let value = serde_json::json!({
-        "version": CONFIG_VERSION,
-        "repo_dir": config.repo_dir.as_deref().unwrap_or(DEFAULT_REPO),
-        "remote": DEFAULT_REMOTE,
-    });
-    let mut text = serde_json::to_string_pretty(&value)
+    let mut value = serde_json::Map::new();
+    value.insert("version".to_string(), serde_json::json!(CONFIG_VERSION));
+    value.insert(
+        "repo_dir".to_string(),
+        serde_json::Value::String(
+            config
+                .repo_dir
+                .as_deref()
+                .unwrap_or(DEFAULT_REPO)
+                .to_string(),
+        ),
+    );
+    value.insert(
+        "remote".to_string(),
+        serde_json::Value::String(DEFAULT_REMOTE.to_string()),
+    );
+    if let Some(cache_dir) = config.cache_dir.as_deref().filter(|s| !s.is_empty()) {
+        value.insert(
+            "cache_dir".to_string(),
+            serde_json::Value::String(cache_dir.to_string()),
+        );
+    }
+    let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(value))
         .map_err(|err| CliError::new(format!("config serialize: {err}")))?;
     text.push('\n');
     fs::write(path, text)?;
@@ -1259,9 +1549,33 @@ fn install_manifest(options: &Options, manifest: &Manifest, force: bool) -> Resu
     for (idx, url) in manifest.urls.iter().enumerate() {
         let filename = scoop_filename(url, idx);
         let payload_path = download_dir.join(format!("{:02}-{}", idx + 1, filename));
-        download_payload(url, &payload_path)?;
-        if let Some(expected) = manifest.hashes.get(idx).and_then(|value| value.as_deref()) {
-            verify_sha256(&payload_path, expected)?;
+        let expected = manifest.hashes.get(idx).and_then(|value| value.as_deref());
+
+        // Cache short-circuit: if we already have the archive and its sha256
+        // matches the manifest, skip the download. Without a manifest hash we
+        // can't trust a stale file, so redownload to be safe.
+        let cached = payload_path.exists()
+            && match expected {
+                Some(hash) => verify_sha256(&payload_path, hash).is_ok(),
+                None => false,
+            };
+        if cached {
+            println!(
+                "Using cached {} for {}",
+                payload_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| payload_path.display().to_string()),
+                manifest.name
+            );
+        } else {
+            if payload_path.exists() {
+                fs::remove_file(&payload_path)?;
+            }
+            download_payload(url, &payload_path)?;
+            if let Some(hash) = expected {
+                verify_sha256(&payload_path, hash)?;
+            }
         }
 
         let target = extracted_dir.join(format!("{:02}", idx + 1));
@@ -1305,6 +1619,14 @@ fn install_manifest(options: &Options, manifest: &Manifest, force: bool) -> Resu
     }
 
     refresh_font_cache(&target_dir);
+
+    // Drop the extraction scratch directory now that the fonts have been
+    // copied to font_root. The downloaded archive in `download_dir` is kept
+    // so subsequent reinstalls can short-circuit; the user can drop it via
+    // `fontctl cache rm <name>`.
+    if work_dir.exists() {
+        let _ = fs::remove_dir_all(&work_dir);
+    }
 
     let record = InstalledFont {
         name: manifest.name.clone(),

@@ -13,6 +13,7 @@ const DEFAULT_REPO: &str = "/home/Kyecox/work/font/scoop-nerd-fonts";
 const DEFAULT_REMOTE: &str = "https://github.com/matthewjberger/scoop-nerd-fonts.git";
 const DEFAULT_CONFIG_FILE: &str = "config.json";
 const DEFAULT_INSTALLED_FILE: &str = "installed.json";
+const DEFAULT_BUCKET_CACHE_FILE: &str = "bucket.json";
 const FONT_EXTENSIONS: &[&str] = &["otf", "ttf", "ttc", "otc", "woff", "woff2"];
 
 type Result<T> = std::result::Result<T, CliError>;
@@ -54,11 +55,13 @@ struct Options {
     bucket_dir: PathBuf,
     config_path: PathBuf,
     installed_path: PathBuf,
+    bucket_cache_path: PathBuf,
     font_root: PathBuf,
     cache_dir: PathBuf,
     repo_overridden: bool,
     bucket_overridden: bool,
     installed_overridden: bool,
+    bucket_cache_overridden: bool,
 }
 
 impl Options {
@@ -83,6 +86,14 @@ impl Options {
                 .unwrap_or_else(|| Path::new("."))
                 .join(DEFAULT_INSTALLED_FILE)
         });
+        let bucket_cache_env = env_path("FONTCTL_BUCKET_CACHE");
+        let bucket_cache_overridden = bucket_cache_env.is_some();
+        let bucket_cache_path = bucket_cache_env.unwrap_or_else(|| {
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(DEFAULT_BUCKET_CACHE_FILE)
+        });
         let font_root = env_path("FONTCTL_FONT_DIR").unwrap_or_else(|| {
             xdg_data_home()
                 .unwrap_or_else(|| home_dir().join(".local/share"))
@@ -100,11 +111,13 @@ impl Options {
             bucket_dir,
             config_path,
             installed_path,
+            bucket_cache_path,
             font_root,
             cache_dir,
             repo_overridden,
             bucket_overridden,
             installed_overridden,
+            bucket_cache_overridden,
         })
     }
 }
@@ -121,6 +134,11 @@ fn run() -> Result<()> {
     let args = parse_global_args(env::args().skip(1).collect(), &mut options)?;
     if options.config_path == options.installed_path {
         return bail("config JSON and installed JSON must be different files");
+    }
+    if options.bucket_cache_path == options.config_path
+        || options.bucket_cache_path == options.installed_path
+    {
+        return bail("bucket cache JSON must differ from config and installed JSON paths");
     }
 
     if args.is_empty() {
@@ -195,6 +213,10 @@ fn parse_global_args(raw: Vec<String>, options: &mut Options) -> Result<Vec<Stri
                     options.installed_path =
                         config_path_parent(&options.config_path).join(DEFAULT_INSTALLED_FILE);
                 }
+                if !options.bucket_cache_overridden {
+                    options.bucket_cache_path =
+                        config_path_parent(&options.config_path).join(DEFAULT_BUCKET_CACHE_FILE);
+                }
             }
             "--installed" | "--installed-json" => {
                 i += 1;
@@ -203,6 +225,14 @@ fn parse_global_args(raw: Vec<String>, options: &mut Options) -> Result<Vec<Stri
                     .ok_or_else(|| CliError::new("--installed requires a path"))?;
                 options.installed_path = PathBuf::from(value);
                 options.installed_overridden = true;
+            }
+            "--bucket-cache" => {
+                i += 1;
+                let value = raw
+                    .get(i)
+                    .ok_or_else(|| CliError::new("--bucket-cache requires a path"))?;
+                options.bucket_cache_path = PathBuf::from(value);
+                options.bucket_cache_overridden = true;
             }
             "--font-dir" => {
                 i += 1;
@@ -251,14 +281,16 @@ Global options:
   --bucket <path>           manifest bucket directory
   --config <path>           config JSON path
   --installed <path>        installed font JSON path
+  --bucket-cache <path>     aggregated bucket cache JSON path
   --font-dir <path>         root directory for installed font files
   --cache-dir <path>        cache directory for downloads/extraction
 
 Defaults:
-  config:  ~/.config/{APP_NAME}/{DEFAULT_CONFIG_FILE}
-  installed: ~/.config/{APP_NAME}/{DEFAULT_INSTALLED_FILE}
-  repo:    {DEFAULT_REPO}
-  remote:  {DEFAULT_REMOTE}
+  config:        ~/.config/{APP_NAME}/{DEFAULT_CONFIG_FILE}
+  installed:     ~/.config/{APP_NAME}/{DEFAULT_INSTALLED_FILE}
+  bucket cache:  ~/.config/{APP_NAME}/{DEFAULT_BUCKET_CACHE_FILE}
+  repo:          {DEFAULT_REPO}
+  remote:        {DEFAULT_REMOTE}
 "
     );
 }
@@ -296,11 +328,18 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
         installed.version = repo_version_or_unknown(&options.repo_dir);
         save_installed(&options.installed_path, &installed)?;
     }
+    let cache_built = refresh_bucket_cache(options)?;
 
     println!("Initialized {APP_NAME}.");
-    println!("Config: {}", options.config_path.display());
+    println!("Config:         {}", options.config_path.display());
     println!("Installed JSON: {}", options.installed_path.display());
-    println!("Repo:   {}", options.repo_dir.display());
+    println!("Bucket cache:   {}", options.bucket_cache_path.display());
+    println!("Repo:           {}", options.repo_dir.display());
+    if !cache_built {
+        println!(
+            "Bucket directory not found yet; run '{APP_NAME} update' to clone the repo and build the bucket cache."
+        );
+    }
     println!(
         "Run '{APP_NAME} update' to git pull or clone scoop-nerd-fonts, then compare installed versions."
     );
@@ -391,19 +430,45 @@ fn cmd_list(options: &Options, args: &[String]) -> Result<()> {
 fn cmd_search(options: &Options, args: &[String]) -> Result<()> {
     let query = first_positional(args, "search requires a query")?;
     let needle = normalize(query);
-    let index = load_bucket_index(&options.bucket_dir)?;
 
     let mut matches = Vec::new();
-    for entry in &index.entries {
-        let manifest = read_manifest(&entry.path)?;
-        let description = manifest.description.as_deref().unwrap_or_default();
-        let haystack = format!("{} {}", normalize(&entry.name), normalize(description));
-        if haystack.contains(&needle) {
-            matches.push((
-                entry.name.clone(),
-                manifest.version_text(),
-                description.to_string(),
-            ));
+    let mut used_cache = false;
+    if options.bucket_cache_path.exists() {
+        match load_bucket_cache(&options.bucket_cache_path) {
+            Ok(cache) => {
+                used_cache = true;
+                for (name, font) in &cache.fonts {
+                    let haystack = format!("{} {}", normalize(name), normalize(&font.description));
+                    if haystack.contains(&needle) {
+                        let version_text = if font.version.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            font.version.clone()
+                        };
+                        matches.push((name.clone(), version_text, font.description.clone()));
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to read bucket cache ({err}); falling back to manifest scan. Run '{APP_NAME} update' to rebuild it."
+                );
+            }
+        }
+    }
+    if !used_cache {
+        let index = load_bucket_index(&options.bucket_dir)?;
+        for entry in &index.entries {
+            let manifest = read_manifest(&entry.path)?;
+            let description = manifest.description.as_deref().unwrap_or_default();
+            let haystack = format!("{} {}", normalize(&entry.name), normalize(description));
+            if haystack.contains(&needle) {
+                matches.push((
+                    entry.name.clone(),
+                    manifest.version_text(),
+                    description.to_string(),
+                ));
+            }
         }
     }
 
@@ -532,6 +597,12 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
     let mut config = load_installed(&options.installed_path)?;
     config.version = git_repo_version(&options.repo_dir)?;
     save_installed(&options.installed_path, &config)?;
+    let bucket_cache = build_and_save_bucket_cache(options)?;
+    println!(
+        "Bucket cache: {} ({} fonts)",
+        options.bucket_cache_path.display(),
+        bucket_cache.fonts.len()
+    );
 
     if config.installed.is_empty() {
         println!(
@@ -597,31 +668,33 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
 }
 
 fn cmd_config(options: &Options) -> Result<()> {
-    println!("Repo:    {}", options.repo_dir.display());
-    println!("Bucket:  {}", options.bucket_dir.display());
-    println!("Config:  {}", options.config_path.display());
-    println!("Installed: {}", options.installed_path.display());
-    println!("Fonts:   {}", options.font_root.display());
-    println!("Cache:   {}", options.cache_dir.display());
-    println!("Remote:  {DEFAULT_REMOTE}");
+    println!("Repo:         {}", options.repo_dir.display());
+    println!("Bucket:       {}", options.bucket_dir.display());
+    println!("Config:       {}", options.config_path.display());
+    println!("Installed:    {}", options.installed_path.display());
+    println!("Bucket cache: {}", options.bucket_cache_path.display());
+    println!("Fonts:        {}", options.font_root.display());
+    println!("Cache:        {}", options.cache_dir.display());
+    println!("Remote:       {DEFAULT_REMOTE}");
     Ok(())
 }
 
 fn cmd_doctor(options: &Options) -> Result<()> {
-    println!("Repo:    {}", path_status(&options.repo_dir));
-    println!("Bucket:  {}", path_status(&options.bucket_dir));
-    println!("Config:  {}", options.config_path.display());
-    println!("Installed: {}", options.installed_path.display());
-    println!("Fonts:   {}", options.font_root.display());
-    println!("Cache:   {}", options.cache_dir.display());
-    println!("git:     {}", command_status("git"));
-    println!("curl:    {}", command_status("curl"));
-    println!("wget:    {}", command_status("wget"));
-    println!("sha256:  {}", command_status("sha256sum"));
-    println!("unzip:   {}", command_status("unzip"));
-    println!("tar:     {}", command_status("tar"));
-    println!("7z:      {}", command_status("7z"));
-    println!("fc-cache: {}", command_status("fc-cache"));
+    println!("Repo:         {}", path_status(&options.repo_dir));
+    println!("Bucket:       {}", path_status(&options.bucket_dir));
+    println!("Config:       {}", options.config_path.display());
+    println!("Installed:    {}", options.installed_path.display());
+    println!("Bucket cache: {}", path_status(&options.bucket_cache_path));
+    println!("Fonts:        {}", options.font_root.display());
+    println!("Cache:        {}", options.cache_dir.display());
+    println!("git:          {}", command_status("git"));
+    println!("curl:         {}", command_status("curl"));
+    println!("wget:         {}", command_status("wget"));
+    println!("sha256:       {}", command_status("sha256sum"));
+    println!("unzip:        {}", command_status("unzip"));
+    println!("tar:          {}", command_status("tar"));
+    println!("7z:           {}", command_status("7z"));
+    println!("fc-cache:     {}", command_status("fc-cache"));
     Ok(())
 }
 
@@ -890,6 +963,25 @@ struct InstalledFont {
     files: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct BucketCache {
+    version: String,
+    fonts: BTreeMap<String, CachedFont>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFont {
+    name: String,
+    version: String,
+    description: String,
+    homepage: String,
+    license: String,
+    extract_dir: String,
+    urls: Vec<String>,
+    hashes: Vec<String>,
+    manifest: String,
+}
+
 fn load_config(path: &Path) -> Result<CliConfig> {
     if !path.exists() {
         return Ok(CliConfig { repo_dir: None });
@@ -999,6 +1091,136 @@ fn save_installed(path: &Path, config: &InstalledFile) -> Result<()> {
     out.push_str("}\n");
     fs::write(path, out)?;
     Ok(())
+}
+
+fn build_bucket_cache(bucket_dir: &Path, repo_dir: &Path) -> Result<BucketCache> {
+    let index = load_bucket_index(bucket_dir)?;
+    let mut fonts = BTreeMap::new();
+    for entry in &index.entries {
+        match read_manifest(&entry.path) {
+            Ok(manifest) => {
+                let cached = CachedFont {
+                    name: manifest.name.clone(),
+                    version: manifest.version.clone().unwrap_or_default(),
+                    description: manifest.description.clone().unwrap_or_default(),
+                    homepage: manifest.homepage.clone().unwrap_or_default(),
+                    license: manifest.license.clone().unwrap_or_default(),
+                    extract_dir: manifest.extract_dir.clone().unwrap_or_default(),
+                    urls: manifest.urls.clone(),
+                    hashes: manifest
+                        .hashes
+                        .iter()
+                        .map(|value| value.clone().unwrap_or_default())
+                        .collect(),
+                    manifest: manifest.path.to_string_lossy().to_string(),
+                };
+                fonts.insert(manifest.name, cached);
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: skipped manifest {}: {err}",
+                    entry.path.display()
+                );
+            }
+        }
+    }
+    Ok(BucketCache {
+        version: repo_version_or_unknown(repo_dir),
+        fonts,
+    })
+}
+
+fn save_bucket_cache(path: &Path, cache: &BucketCache) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut out = String::new();
+    out.push_str("{\n");
+    push_json_string_field(&mut out, "version", &cache.version, 2, true);
+    out.push_str("  \"bucket\": {\n");
+    let total = cache.fonts.len();
+    for (idx, (key, font)) in cache.fonts.iter().enumerate() {
+        out.push_str(&format!("    \"{}\": {{\n", json_escape(key)));
+        push_json_string_field(&mut out, "name", &font.name, 6, true);
+        push_json_string_field(&mut out, "version", &font.version, 6, true);
+        push_json_string_field(&mut out, "description", &font.description, 6, true);
+        push_json_string_field(&mut out, "homepage", &font.homepage, 6, true);
+        push_json_string_field(&mut out, "license", &font.license, 6, true);
+        push_json_string_field(&mut out, "extract_dir", &font.extract_dir, 6, true);
+        push_json_array_field(&mut out, "urls", &font.urls, 6, true);
+        push_json_array_field(&mut out, "hashes", &font.hashes, 6, true);
+        push_json_string_field(&mut out, "manifest", &font.manifest, 6, false);
+        if idx + 1 == total {
+            out.push_str("    }\n");
+        } else {
+            out.push_str("    },\n");
+        }
+    }
+    out.push_str("  }\n");
+    out.push_str("}\n");
+    fs::write(path, out)?;
+    Ok(())
+}
+
+fn load_bucket_cache(path: &Path) -> Result<BucketCache> {
+    if !path.exists() {
+        return Ok(BucketCache {
+            version: "unknown".to_string(),
+            fonts: BTreeMap::new(),
+        });
+    }
+
+    let text = fs::read_to_string(path)?;
+    let json = parse_json(&text)?;
+    let object = json.as_object().ok_or_else(|| {
+        CliError::new(format!(
+            "bucket cache is not a JSON object: {}",
+            path.display()
+        ))
+    })?;
+    let version = json_string(object.get("version")).unwrap_or_else(|| "unknown".to_string());
+    let mut fonts = BTreeMap::new();
+
+    if let Some(bucket_obj) = object.get("bucket").and_then(Json::as_object) {
+        for (key, value) in bucket_obj {
+            let Some(record_obj) = value.as_object() else {
+                continue;
+            };
+            let name = json_string(record_obj.get("name")).unwrap_or_else(|| key.clone());
+            let cached = CachedFont {
+                name: name.clone(),
+                version: json_string(record_obj.get("version")).unwrap_or_default(),
+                description: json_string(record_obj.get("description")).unwrap_or_default(),
+                homepage: json_string(record_obj.get("homepage")).unwrap_or_default(),
+                license: json_string(record_obj.get("license")).unwrap_or_default(),
+                extract_dir: json_string(record_obj.get("extract_dir")).unwrap_or_default(),
+                urls: json_string_or_array(record_obj.get("urls")).unwrap_or_default(),
+                hashes: json_string_or_array(record_obj.get("hashes")).unwrap_or_default(),
+                manifest: json_string(record_obj.get("manifest")).unwrap_or_default(),
+            };
+            fonts.insert(name, cached);
+        }
+    }
+
+    Ok(BucketCache { version, fonts })
+}
+
+/// Rebuild the bucket cache only when the repo bucket directory exists yet.
+/// Returns `Ok(true)` when the cache was (re)written, `Ok(false)` when
+/// the repo bucket isn't present (e.g. right after `init` before `update`).
+fn refresh_bucket_cache(options: &Options) -> Result<bool> {
+    if !options.bucket_dir.is_dir() {
+        return Ok(false);
+    }
+    build_and_save_bucket_cache(options)?;
+    Ok(true)
+}
+
+fn build_and_save_bucket_cache(options: &Options) -> Result<BucketCache> {
+    let cache = build_bucket_cache(&options.bucket_dir, &options.repo_dir)?;
+    save_bucket_cache(&options.bucket_cache_path, &cache)?;
+    Ok(cache)
 }
 
 fn push_json_string_field(out: &mut String, key: &str, value: &str, indent: usize, comma: bool) {

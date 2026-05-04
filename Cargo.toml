@@ -2,6 +2,10 @@
 name = "nfcl"
 version = "0.1.0"
 edition = "2024"
+description = "Linux font manager backed by scoop-nerd-fonts manifests."
+license = "Apache-2.0"
+repository = "https://github.com/glassywater/nfcl"
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

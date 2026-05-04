@@ -576,11 +576,15 @@ fn cmd_info(options: &Options, args: &[String]) -> Result<()> {
     let installed = config.installed.get(&manifest.name);
     match installed {
         Some(record) => {
-            println!("Installed:   yes");
-            println!("Font dir:    {}", record.font_dir);
-            println!("Files:       {}", record.files.len());
+            let size = installed_size(record);
+            println!("Installed:    yes");
+            println!("Installed at: {}", parse_install_time(&record.installed_at));
+            println!("Installed ver: {}", record.version);
+            println!("Files:        {}", record.files.len());
+            println!("Size:         {}", format_size(size));
+            println!("Font dir:     {}", record.font_dir);
         }
-        None => println!("Installed:   no"),
+        None => println!("Installed:    no"),
     }
     Ok(())
 }
@@ -637,15 +641,96 @@ fn cmd_installed(options: &Options) -> Result<()> {
         return Ok(());
     }
 
+    struct Row {
+        name: String,
+        version: String,
+        installed_at: String,
+        files: String,
+        size_text: String,
+    }
+
+    let mut rows: Vec<Row> = Vec::with_capacity(config.installed.len());
+    let mut total_size = 0u64;
     for record in config.installed.values() {
+        let size = installed_size(record);
+        total_size += size;
+        rows.push(Row {
+            name: record.name.clone(),
+            version: record.version.clone(),
+            installed_at: parse_install_time(&record.installed_at),
+            files: record.files.len().to_string(),
+            size_text: format_size(size),
+        });
+    }
+
+    let header = ("NAME", "VERSION", "INSTALLED", "FILES", "SIZE");
+    let w_name = rows
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(header.0.len());
+    let w_ver = rows
+        .iter()
+        .map(|r| r.version.len())
+        .max()
+        .unwrap_or(0)
+        .max(header.1.len());
+    let w_date = rows
+        .iter()
+        .map(|r| r.installed_at.len())
+        .max()
+        .unwrap_or(0)
+        .max(header.2.len());
+    let w_files = rows
+        .iter()
+        .map(|r| r.files.len())
+        .max()
+        .unwrap_or(0)
+        .max(header.3.len());
+    let w_size = rows
+        .iter()
+        .map(|r| r.size_text.len())
+        .max()
+        .unwrap_or(0)
+        .max(header.4.len());
+
+    println!(
+        "{:<w_name$}  {:<w_ver$}  {:<w_date$}  {:>w_files$}  {:>w_size$}",
+        header.0,
+        header.1,
+        header.2,
+        header.3,
+        header.4,
+        w_name = w_name,
+        w_ver = w_ver,
+        w_date = w_date,
+        w_files = w_files,
+        w_size = w_size,
+    );
+
+    for row in &rows {
         println!(
-            "{}  {}  {} files  {}",
-            record.name,
-            record.version,
-            record.files.len(),
-            record.font_dir
+            "{:<w_name$}  {:<w_ver$}  {:<w_date$}  {:>w_files$}  {:>w_size$}",
+            row.name,
+            row.version,
+            row.installed_at,
+            row.files,
+            row.size_text,
+            w_name = w_name,
+            w_ver = w_ver,
+            w_date = w_date,
+            w_files = w_files,
+            w_size = w_size,
         );
     }
+
+    println!(
+        "---\n{} font{} installed, {} total",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        format_size(total_size)
+    );
     Ok(())
 }
 
@@ -980,6 +1065,48 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Render a unix timestamp (seconds since 1970-01-01 UTC) as
+/// "YYYY-MM-DD HH:MM:SS UTC" using Howard Hinnant's `civil_from_days`
+/// algorithm — no extra crate, handles negatives.
+fn format_unix_timestamp(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    if m <= 2 {
+        y += 1;
+    }
+
+    let h = (secs_of_day / 3600) as u32;
+    let min = ((secs_of_day % 3600) / 60) as u32;
+    let s = (secs_of_day % 60) as u32;
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02} UTC")
+}
+
+fn parse_install_time(value: &str) -> String {
+    value
+        .parse::<i64>()
+        .map(format_unix_timestamp)
+        .unwrap_or_else(|_| "(unknown)".to_string())
+}
+
+fn installed_size(record: &InstalledFont) -> u64 {
+    record
+        .files
+        .iter()
+        .filter_map(|f| fs::metadata(f).ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 #[derive(Debug, Clone)]
@@ -2207,6 +2334,29 @@ mod tests {
 
         let missing: ManifestRaw = serde_json::from_str(r#"{"url":"x.zip"}"#).unwrap();
         assert!(missing.license.is_none());
+    }
+
+    #[test]
+    fn format_unix_timestamp_known_dates() {
+        assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(
+            format_unix_timestamp(946_684_800),
+            "2000-01-01 00:00:00 UTC"
+        );
+        // leap day (2024-02-29 12:34:56 UTC = 1709210096)
+        assert_eq!(
+            format_unix_timestamp(1_709_210_096),
+            "2024-02-29 12:34:56 UTC"
+        );
+        // pre-epoch: -1 = 1969-12-31 23:59:59 UTC
+        assert_eq!(format_unix_timestamp(-1), "1969-12-31 23:59:59 UTC");
+    }
+
+    #[test]
+    fn parse_install_time_handles_garbage() {
+        assert_eq!(parse_install_time(""), "(unknown)");
+        assert_eq!(parse_install_time("not-a-number"), "(unknown)");
+        assert_eq!(parse_install_time("0"), "1970-01-01 00:00:00 UTC");
     }
 
     #[test]

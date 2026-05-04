@@ -314,7 +314,8 @@ Commands:
   install <font> [--force]  Download, verify, extract, and install a font
   uninstall <font>          Remove a font installed by this CLI
   installed                 Show fonts recorded in config JSON
-  update [--install]        git pull/clone manifests, then compare installed versions
+  update [* | <font>...]    git pull/clone manifests, report status, and (with
+                            * or named fonts) reinstall outdated entries
   cache list                List archives kept in the download cache
   cache rm <font>|--all     Drop a single cached archive or wipe the whole cache
   config [<proxy>]          Print settings, or persist a download proxy
@@ -772,7 +773,28 @@ fn cmd_installed(options: &Options) -> Result<()> {
 }
 
 fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
-    let apply_install = args.iter().any(|arg| arg == "--install");
+    // Argument shapes:
+    //   fontctl update                         -> sync + report only (legacy behavior)
+    //   fontctl update *                       -> sync + reinstall every outdated font
+    //   fontctl update --install               -> alias of `*`, kept for old scripts
+    //   fontctl update <name> [<name> ...]     -> sync + reinstall only the named ones
+    //                                             (each name MUST already be installed;
+    //                                              names already on the latest version
+    //                                              are skipped with "already current")
+    // `*` and explicit names cannot be mixed — pick one.
+    let star_or_all = args
+        .iter()
+        .any(|arg| arg == "*" || arg == "--all" || arg == "--install");
+    let names: Vec<&str> = args
+        .iter()
+        .filter(|arg| !arg.starts_with('-') && arg.as_str() != "*")
+        .map(String::as_str)
+        .collect();
+    if star_or_all && !names.is_empty() {
+        return bail("update: cannot mix '*' / --install with explicit font names");
+    }
+    let reinstall = star_or_all || !names.is_empty();
+
     sync_bucket_repo(options)?;
     options.bucket_dir = options.repo_dir.join("bucket");
 
@@ -794,12 +816,34 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // Resolve `targets` to actual installed.json keys. Empty `names` (with or
+    // without `*`) means "every installed font".
+    let targets: Vec<String> = if names.is_empty() {
+        config.installed.keys().cloned().collect()
+    } else {
+        let mut out = Vec::with_capacity(names.len());
+        let mut seen = HashSet::new();
+        for query in &names {
+            let key = resolve_installed_key(&config, query).ok_or_else(|| {
+                CliError::new(format!("'{query}' is not installed by {APP_NAME}"))
+            })?;
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+        out
+    };
+
     let index = load_bucket_index(&options.bucket_dir)?;
     let mut outdated = Vec::new();
     let mut missing = Vec::new();
     let mut current = 0usize;
 
-    for record in config.installed.values() {
+    for key in &targets {
+        let record = config
+            .installed
+            .get(key)
+            .expect("target key was resolved from config.installed");
         let entry = match resolve_manifest(&index, &record.name) {
             Ok(entry) => entry,
             Err(_) => {
@@ -811,7 +855,10 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
         let manifest_version = manifest.version_text();
         if manifest_version == record.version {
             current += 1;
-            println!("OK       {} {}", record.name, record.version);
+            println!(
+                "OK       {} {} (already current)",
+                record.name, record.version
+            );
         } else {
             println!(
                 "OUTDATED {} installed={} bucket={}",
@@ -826,13 +873,14 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
     }
 
     println!(
-        "Checked {} installed fonts: {current} current, {} outdated, {} missing.",
-        config.installed.len(),
+        "Checked {} font{}: {current} current, {} outdated, {} missing.",
+        targets.len(),
+        if targets.len() == 1 { "" } else { "s" },
         outdated.len(),
         missing.len()
     );
 
-    if apply_install {
+    if reinstall {
         for name in outdated {
             let record = install_by_query(options, &name, true)?;
             println!(
@@ -843,7 +891,9 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
             );
         }
     } else if !outdated.is_empty() {
-        println!("Run '{APP_NAME} update --install' to reinstall outdated fonts.");
+        println!(
+            "Run '{APP_NAME} update *' or '{APP_NAME} update <font>...' to reinstall outdated fonts."
+        );
     }
 
     Ok(())

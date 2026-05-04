@@ -26,6 +26,8 @@ fontctl search cascadia              # find something
 fontctl info Cascadia-Code           # inspect a manifest
 fontctl install Cascadia-Code        # download + verify + install
 fontctl list                         # see what's installed
+fontctl update                       # check for new versions
+fontctl update '*'                   # actually upgrade every outdated font
 fontctl uninstall Cascadia-Code      # remove it again
 ```
 
@@ -140,15 +142,37 @@ Identical to `list` (without `--all`). Kept as an explicit name for scripts.
 ### update
 
 ```sh
-fontctl update            # git pull/clone + rebuild bucket cache + report stale
-fontctl update --install  # also reinstall any font whose bucket version moved
+fontctl update                  # report only: pull manifests + show what's stale
+fontctl update '*'              # also reinstall every outdated font
+fontctl update FiraCode-NF      # only act on these names; up-to-date ones are
+fontctl update FontA FontB      # skipped, missing-from-installed names error out
+fontctl update --install        # legacy alias of `update *`
 ```
 
-If `repo_dir` already exists it runs `git pull --ff-only` there, otherwise it
-clones from the configured `remote` (default
-`https://github.com/matthewjberger/scoop-nerd-fonts.git`). After syncing it
-walks `installed.json` and prints which entries are now out of date relative
-to the bucket. With `--install`, outdated fonts are reinstalled.
+Three argument shapes, one underlying pipeline:
+
+1. **`fontctl update`** — runs `git -C <repo> pull --ff-only` (or `git clone`
+   if the repo doesn't exist yet), rebuilds `bucket.json`, then walks every
+   font in `installed.json` and prints `OK` / `OUTDATED` / `MISSING`. The
+   font directories are not touched.
+2. **`fontctl update '*'`** (quote it so the shell doesn't glob) — same
+   report, then reinstalls every `OUTDATED` entry by calling
+   `install --force` under the hood. Cached download archives whose SHA-256
+   still matches the new manifest are reused; otherwise they're re-downloaded.
+   `fontctl update --install` is kept as a synonym for old scripts.
+3. **`fontctl update <name> [<name>...]`** — same sync step, but the
+   `OK / OUTDATED` walk and the reinstall are scoped to just the listed
+   names. Up-to-date names are skipped with `OK ... (already current)`.
+   Names that aren't in `installed.json` cause an error.
+
+Combining `*` (or `--install`) with explicit names is rejected — pick one.
+
+What `update` does **not** do:
+- It will not act on `MISSING` entries (manifest deleted upstream); use
+  `fontctl uninstall <name>` to clear them out.
+- It will not delete cached old-version archives. Old zips stay in
+  `~/.cache/fontctl/downloads/` until you `fontctl cache rm <name>` or
+  `fontctl cache rm --all`.
 
 ### cache list / cache rm
 

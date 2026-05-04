@@ -318,9 +318,9 @@ Commands:
                             * or named fonts) reinstall outdated entries
   cache list                List archives kept in the download cache
   cache rm <font>|--all     Drop a single cached archive or wipe the whole cache
-  config [<proxy>]          Print settings, or persist a download proxy
-                            (e.g. `{APP_NAME} config 127.0.0.1:7890`,
-                             `{APP_NAME} config none` to clear)
+  config [<key> <value>]    Print settings, or write a key/value pair into config.json
+                            (e.g. `{APP_NAME} config proxy 127.0.0.1:7890`,
+                             `{APP_NAME} config proxy none` to remove the key)
   doctor                    Check local tools and paths
 
 Global options:
@@ -918,33 +918,91 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
 }
 
 fn cmd_config(options: &mut Options, args: &[String]) -> Result<()> {
-    // `fontctl config` (no args)             -> print current settings
-    // `fontctl config <host:port|url>`       -> persist proxy = <value>
-    // `fontctl config none|off|-|""`         -> clear the persisted proxy
+    // Recognized invocations:
+    //   fontctl config                          -> print every resolved path + proxy
+    //   fontctl config <key> <value>            -> persist "<key>": "<value>" into config.json
+    //   fontctl config <key> <none-token>       -> remove the key from config.json
+    //     where <none-token> ∈ {none, off, -, clear, ""}
+    //
+    // Any string is a valid key. fontctl itself only acts on a few known keys
+    // (proxy / repo_dir / cache_dir); other keys are kept in the JSON as-is so
+    // user scripts or future versions of fontctl can read them.
     if !args.is_empty() {
-        if args.len() > 1 {
-            return bail("config takes at most one argument: the proxy value (or 'none' to clear)");
+        if args.len() != 2 {
+            return bail(
+                "config: usage is `fontctl config <key> <value>` \
+                 (use `fontctl config <key> none` to clear, or `fontctl config` to print)",
+            );
         }
-        let raw = args[0].trim();
+        let key = args[0].as_str();
+        let raw_value = args[1].as_str().trim();
+        let clearing = matches!(raw_value, "" | "none" | "off" | "-" | "clear");
+
         let mut on_disk = load_config(&options.config_path)?;
-        let new_proxy: Option<String> = match raw {
-            "" | "none" | "off" | "-" | "clear" => None,
-            other => Some(other.to_string()),
-        };
-        on_disk.proxy = new_proxy.clone();
-        // repo_dir/cache_dir come from current Options so save_config doesn't
-        // overwrite them with stale on-disk values it just loaded back.
-        on_disk.repo_dir = Some(options.repo_dir.to_string_lossy().to_string());
-        on_disk.cache_dir = Some(options.cache_dir.to_string_lossy().to_string());
-        save_config(&options.config_path, &on_disk)?;
-        // Reflect the change in this process's Options too — useful if another
-        // command (e.g. install) is chained later in scripts.
-        if !options.proxy_overridden {
-            options.proxy = new_proxy.clone();
+        match key {
+            "proxy" => {
+                on_disk.proxy = if clearing {
+                    None
+                } else {
+                    Some(raw_value.to_string())
+                };
+            }
+            "repo_dir" => {
+                on_disk.repo_dir = if clearing {
+                    None
+                } else {
+                    Some(raw_value.to_string())
+                };
+            }
+            "cache_dir" => {
+                on_disk.cache_dir = if clearing {
+                    None
+                } else {
+                    Some(raw_value.to_string())
+                };
+            }
+            "version" | "remote" => {
+                return bail(format!(
+                    "'{key}' is managed by {APP_NAME} and cannot be set via `config`"
+                ));
+            }
+            other => {
+                if clearing {
+                    on_disk.extra.remove(other);
+                } else {
+                    on_disk.extra.insert(
+                        other.to_string(),
+                        serde_json::Value::String(raw_value.to_string()),
+                    );
+                }
+            }
         }
-        match new_proxy {
-            Some(value) => println!("proxy = {value}"),
-            None => println!("proxy cleared"),
+        save_config(&options.config_path, &on_disk)?;
+
+        // Keep the in-process Options aligned for chained commands (only
+        // matters for the runtime-relevant keys).
+        if !clearing {
+            match key {
+                "proxy" if !options.proxy_overridden => {
+                    options.proxy = Some(raw_value.to_string());
+                }
+                "cache_dir" if !options.cache_dir_overridden => {
+                    options.cache_dir = expand_home(raw_value);
+                }
+                "repo_dir" if !options.repo_overridden => {
+                    options.repo_dir = expand_home(raw_value);
+                    if !options.bucket_overridden {
+                        options.bucket_dir = options.repo_dir.join("bucket");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if clearing {
+            println!("{key} cleared");
+        } else {
+            println!("{key} = {raw_value}");
         }
         return Ok(());
     }
@@ -1516,6 +1574,12 @@ struct CliConfig {
     cache_dir: Option<String>,
     #[serde(default)]
     proxy: Option<String>,
+    /// Any other top-level keys the user has stashed via `fontctl config <k> <v>`
+    /// (or hand-edited). fontctl itself only reads the strongly-typed fields
+    /// above; everything here is just round-tripped so save_config doesn't
+    /// silently delete it.
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1638,11 +1702,7 @@ where
 
 fn load_config(path: &Path) -> Result<CliConfig> {
     if !path.exists() {
-        return Ok(CliConfig {
-            repo_dir: None,
-            cache_dir: None,
-            proxy: None,
-        });
+        return Ok(CliConfig::default());
     }
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text)
@@ -1654,6 +1714,17 @@ fn save_config(path: &Path, config: &CliConfig) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let mut value = serde_json::Map::new();
+    // Dump unknown keys first so the strongly-typed ones below win on
+    // collisions (and so version/remote stay canonical).
+    for (k, v) in &config.extra {
+        if matches!(
+            k.as_str(),
+            "version" | "remote" | "repo_dir" | "cache_dir" | "proxy"
+        ) {
+            continue;
+        }
+        value.insert(k.clone(), v.clone());
+    }
     value.insert("version".to_string(), serde_json::json!(CONFIG_VERSION));
     value.insert(
         "repo_dir".to_string(),

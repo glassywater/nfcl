@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-const APP_NAME: &str = "fontctl";
+const APP_NAME: &str = "nfcl";
 const CONFIG_VERSION: u32 = 1;
 const DEFAULT_REPO: &str = "/home/Kyecox/work/font/scoop-nerd-fonts";
 const DEFAULT_REMOTE: &str = "https://github.com/matthewjberger/scoop-nerd-fonts.git";
@@ -71,19 +71,19 @@ struct Options {
 
 impl Options {
     fn from_env() -> Result<Self> {
-        let repo_env = env_path("FONTCTL_REPO");
-        let bucket_env = env_path("FONTCTL_BUCKET");
+        let repo_env = env_path("NFCL_REPO");
+        let bucket_env = env_path("NFCL_BUCKET");
         let repo_overridden = repo_env.is_some();
         let bucket_overridden = bucket_env.is_some();
         let repo_dir = repo_env.unwrap_or_else(|| PathBuf::from(DEFAULT_REPO));
         let bucket_dir = bucket_env.unwrap_or_else(|| repo_dir.join("bucket"));
-        let config_path = env_path("FONTCTL_CONFIG").unwrap_or_else(|| {
+        let config_path = env_path("NFCL_CONFIG").unwrap_or_else(|| {
             xdg_config_home()
                 .unwrap_or_else(|| home_dir().join(".config"))
                 .join(APP_NAME)
                 .join(DEFAULT_CONFIG_FILE)
         });
-        let installed_env = env_path("FONTCTL_INSTALLED");
+        let installed_env = env_path("NFCL_INSTALLED");
         let installed_overridden = installed_env.is_some();
         let installed_path = installed_env.unwrap_or_else(|| {
             config_path
@@ -91,7 +91,7 @@ impl Options {
                 .unwrap_or_else(|| Path::new("."))
                 .join(DEFAULT_INSTALLED_FILE)
         });
-        let bucket_cache_env = env_path("FONTCTL_BUCKET_CACHE");
+        let bucket_cache_env = env_path("NFCL_BUCKET_CACHE");
         let bucket_cache_overridden = bucket_cache_env.is_some();
         let bucket_cache_path = bucket_cache_env.unwrap_or_else(|| {
             config_path
@@ -99,20 +99,20 @@ impl Options {
                 .unwrap_or_else(|| Path::new("."))
                 .join(DEFAULT_BUCKET_CACHE_FILE)
         });
-        let font_root = env_path("FONTCTL_FONT_DIR").unwrap_or_else(|| {
+        let font_root = env_path("NFCL_FONT_DIR").unwrap_or_else(|| {
             xdg_data_home()
                 .unwrap_or_else(|| home_dir().join(".local/share"))
                 .join("fonts")
                 .join(APP_NAME)
         });
-        let cache_env = env_path("FONTCTL_CACHE_DIR");
+        let cache_env = env_path("NFCL_CACHE_DIR");
         let cache_dir_overridden = cache_env.is_some();
         let cache_dir = cache_env.unwrap_or_else(|| {
             xdg_cache_home()
                 .unwrap_or_else(|| home_dir().join(".cache"))
                 .join(APP_NAME)
         });
-        let proxy_env = env::var("FONTCTL_PROXY")
+        let proxy_env = env::var("NFCL_PROXY")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -160,7 +160,7 @@ fn run() -> Result<()> {
     // `init` is the only command that may run without an existing config
     // directory — its job is to create it. For every other invocation
     // (including `help`, `--help`, no args, and unknown commands) we
-    // require ~/.config/fontctl/ to exist and prompt for `--init` if not.
+    // require ~/.config/nfcl/ to exist and prompt for `--init` if not.
     let is_init = args.first().map(String::as_str) == Some("init");
     if !is_init {
         require_config_dir(&options)?;
@@ -347,7 +347,7 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
 
     // Preserve any cache_dir the user has previously persisted (or hand-edited
     // into config.json), unless this invocation explicitly overrode it via
-    // --cache-dir / FONTCTL_CACHE_DIR.
+    // --cache-dir / NFCL_CACHE_DIR.
     if !options.cache_dir_overridden {
         if let Some(saved) = config
             .cache_dir
@@ -358,7 +358,7 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
             options.cache_dir = expand_home(saved);
         }
     }
-    // Same idea for proxy: env var FONTCTL_PROXY wins, otherwise we reuse
+    // Same idea for proxy: env var NFCL_PROXY wins, otherwise we reuse
     // whatever was previously persisted.
     if !options.proxy_overridden {
         options.proxy = config
@@ -406,7 +406,7 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
 
     // Adopt any font directories that exist on disk but aren't recorded in
     // installed.json — typical after a re-init / dotfile sync where the
-    // ~/.local/share/fonts/fontctl/ tree survived but installed.json didn't.
+    // ~/.local/share/fonts/nfcl/ tree survived but installed.json didn't.
     // Keys already present in installed.json are left untouched.
     let mut installed_now = load_installed(&options.installed_path)?;
     let adopted = adopt_existing_fonts(options, &mut installed_now)?;
@@ -792,10 +792,10 @@ fn cmd_installed(options: &Options) -> Result<()> {
 
 fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
     // Argument shapes:
-    //   fontctl update                         -> sync + report only (legacy behavior)
-    //   fontctl update *                       -> sync + reinstall every outdated font
-    //   fontctl update --install               -> alias of `*`, kept for old scripts
-    //   fontctl update <name> [<name> ...]     -> sync + reinstall only the named ones
+    //   nfcl update                         -> sync + report only (legacy behavior)
+    //   nfcl update *                       -> sync + reinstall every outdated font
+    //   nfcl update --install               -> alias of `*`, kept for old scripts
+    //   nfcl update <name> [<name> ...]     -> sync + reinstall only the named ones
     //                                             (each name MUST already be installed;
     //                                              names already on the latest version
     //                                              are skipped with "already current")
@@ -919,19 +919,19 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
 
 fn cmd_config(options: &mut Options, args: &[String]) -> Result<()> {
     // Recognized invocations:
-    //   fontctl config                          -> print every resolved path + proxy
-    //   fontctl config <key> <value>            -> persist "<key>": "<value>" into config.json
-    //   fontctl config <key> <none-token>       -> remove the key from config.json
+    //   nfcl config                          -> print every resolved path + proxy
+    //   nfcl config <key> <value>            -> persist "<key>": "<value>" into config.json
+    //   nfcl config <key> <none-token>       -> remove the key from config.json
     //     where <none-token> ∈ {none, off, -, clear, ""}
     //
-    // Any string is a valid key. fontctl itself only acts on a few known keys
+    // Any string is a valid key. nfcl itself only acts on a few known keys
     // (proxy / repo_dir / cache_dir); other keys are kept in the JSON as-is so
-    // user scripts or future versions of fontctl can read them.
+    // user scripts or future versions of nfcl can read them.
     if !args.is_empty() {
         if args.len() != 2 {
             return bail(
-                "config: usage is `fontctl config <key> <value>` \
-                 (use `fontctl config <key> none` to clear, or `fontctl config` to print)",
+                "config: usage is `nfcl config <key> <value>` \
+                 (use `nfcl config <key> none` to clear, or `nfcl config` to print)",
             );
         }
         let key = args[0].as_str();
@@ -1574,8 +1574,8 @@ struct CliConfig {
     cache_dir: Option<String>,
     #[serde(default)]
     proxy: Option<String>,
-    /// Any other top-level keys the user has stashed via `fontctl config <k> <v>`
-    /// (or hand-edited). fontctl itself only reads the strongly-typed fields
+    /// Any other top-level keys the user has stashed via `nfcl config <k> <v>`
+    /// (or hand-edited). nfcl itself only reads the strongly-typed fields
     /// above; everything here is just round-tripped so save_config doesn't
     /// silently delete it.
     #[serde(flatten)]
@@ -1666,7 +1666,7 @@ where
     })
 }
 
-/// Accept the legacy `"version": <number>` shape that older fontctl builds
+/// Accept the legacy `"version": <number>` shape that older nfcl builds
 /// wrote into installed.json before we switched to git versions.
 fn deserialize_string_lenient<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -2066,7 +2066,7 @@ fn install_manifest(options: &Options, manifest: &Manifest, force: bool) -> Resu
     // Drop the extraction scratch directory now that the fonts have been
     // copied to font_root. The downloaded archive in `download_dir` is kept
     // so subsequent reinstalls can short-circuit; the user can drop it via
-    // `fontctl cache rm <name>`.
+    // `nfcl cache rm <name>`.
     if work_dir.exists() {
         let _ = fs::remove_dir_all(&work_dir);
     }
@@ -2688,7 +2688,7 @@ mod tests {
 
     #[test]
     fn installed_file_accepts_legacy_numeric_version() {
-        // older fontctl wrote "version": 1 (number); we now expect a string,
+        // older nfcl wrote "version": 1 (number); we now expect a string,
         // but should still load the file rather than fail outright.
         let installed: InstalledFile =
             serde_json::from_str(r#"{"version": 1, "installed": {}}"#).unwrap();

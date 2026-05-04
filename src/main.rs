@@ -320,7 +320,9 @@ Commands:
   list [--all]              List installed fonts (use --all to dump the full bucket)
   search <query>            Search bucket manifests
   info <font>               Show manifest details
-  install <font> [--force]  Download, verify, extract, and install a font
+  install <font>... [--force]
+                            Download, verify, extract, and install one or
+                            more fonts (each name is processed in turn)
   uninstall <font>          Remove a font installed by this CLI
   installed                 Show fonts recorded in config JSON
   update [* | <font>...]    git pull/clone manifests, report status, and (with
@@ -655,16 +657,76 @@ fn cmd_info(options: &Options, args: &[String]) -> Result<()> {
 }
 
 fn cmd_install(options: &Options, args: &[String]) -> Result<()> {
+    // Multi-font form:
+    //   nfcl install A B C [--force]
+    // Each name is resolved + installed in turn. A failure on one font
+    // doesn't abort the run — we keep going and surface a summary at the
+    // end, exiting non-zero only if at least one install actually failed.
+    // Duplicate names (same key after manifest resolution would still be a
+    // duplicate at the query level) are silently de-duplicated so users can
+    // paste lists without worrying.
     let force = flag_present(args, &["--force", "-f"]);
-    let query = first_positional(args, "install requires a font name")?;
-    let record = install_by_query(options, query, force)?;
-    println!(
-        "Installed {} {} with {} font files.",
-        record.name,
-        record.version,
-        record.files.len()
-    );
+    let mut queries: Vec<&str> = Vec::new();
+    let mut seen = HashSet::new();
+    for arg in args {
+        if arg.starts_with('-') {
+            continue;
+        }
+        if seen.insert(arg.as_str()) {
+            queries.push(arg.as_str());
+        }
+    }
+
+    if queries.is_empty() {
+        return bail("install requires a font name");
+    }
+
+    let total = queries.len();
+    let mut succeeded: Vec<InstalledFont> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for (idx, query) in queries.iter().enumerate() {
+        if total > 1 {
+            println!("[{}/{total}] Installing {query}...", idx + 1);
+        }
+        match install_by_query(options, query, force) {
+            Ok(record) => {
+                println!(
+                    "Installed {} {} with {} font files.",
+                    record.name,
+                    record.version,
+                    record.files.len()
+                );
+                succeeded.push(record);
+            }
+            Err(err) => {
+                eprintln!("error: failed to install '{query}': {err}");
+                failed.push((query.to_string(), err.to_string()));
+            }
+        }
+    }
+
     println!("Config: {}", options.config_path.display());
+    if total > 1 {
+        println!(
+            "---\n{} of {total} installed, {} failed.",
+            succeeded.len(),
+            failed.len()
+        );
+    }
+
+    if !failed.is_empty() {
+        let names = failed
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return bail(format!(
+            "{} font{} failed to install: {names}",
+            failed.len(),
+            if failed.len() == 1 { "" } else { "s" }
+        ));
+    }
     Ok(())
 }
 

@@ -139,6 +139,15 @@ impl Options {
 }
 
 fn main() {
+    // Restore SIGPIPE to its default disposition so that piping into `head`
+    // / `less q` / etc. exits cleanly instead of triggering Rust's default
+    // "broken pipe" panic on the next println!. This is the standard fix
+    // for Unix CLIs written in Rust.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     if let Err(err) = run() {
         eprintln!("{APP_NAME}: {err}");
         std::process::exit(1);
@@ -523,7 +532,7 @@ fn cmd_list(options: &Options, args: &[String]) -> Result<()> {
     // catalog with `*` markers for already-installed fonts. We deliberately
     // don't accept `--bucket`/`--installed` here because both are taken as
     // global path overrides by parse_global_args.
-    let want_bucket = args.iter().any(|arg| arg == "--all" || arg == "-a");
+    let want_bucket = flag_present(args, &["--all", "-a"]);
     if !want_bucket {
         return cmd_installed(options);
     }
@@ -646,7 +655,7 @@ fn cmd_info(options: &Options, args: &[String]) -> Result<()> {
 }
 
 fn cmd_install(options: &Options, args: &[String]) -> Result<()> {
-    let force = args.iter().any(|arg| arg == "--force" || arg == "-f");
+    let force = flag_present(args, &["--force", "-f"]);
     let query = first_positional(args, "install requires a font name")?;
     let record = install_by_query(options, query, force)?;
     println!(
@@ -800,9 +809,7 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
     //                                              names already on the latest version
     //                                              are skipped with "already current")
     // `*` and explicit names cannot be mixed — pick one.
-    let star_or_all = args
-        .iter()
-        .any(|arg| arg == "*" || arg == "--all" || arg == "--install");
+    let star_or_all = flag_present(args, &["*", "--all", "--install"]);
     let names: Vec<&str> = args
         .iter()
         .filter(|arg| !arg.starts_with('-') && arg.as_str() != "*")
@@ -1134,7 +1141,7 @@ fn cmd_cache_list(options: &Options) -> Result<()> {
 }
 
 fn cmd_cache_rm(options: &Options, args: &[String]) -> Result<()> {
-    let all = args.iter().any(|a| a == "--all");
+    let all = flag_present(args, &["--all"]);
     let positional: Vec<&str> = args
         .iter()
         .filter(|a| !a.starts_with("--"))
@@ -2448,6 +2455,14 @@ fn first_positional<'a>(args: &'a [String], message: &str) -> Result<&'a str> {
         .find(|arg| !arg.starts_with('-'))
         .map(|arg| arg.as_str())
         .ok_or_else(|| CliError::new(message))
+}
+
+/// Return true if any of `args` exactly matches one of `names`. Centralizes
+/// the `args.iter().any(|a| a == "--all" || a == "-a")` pattern so adding a
+/// new alias means touching one tuple instead of grepping callsites.
+fn flag_present(args: &[String], names: &[&str]) -> bool {
+    args.iter()
+        .any(|arg| names.iter().any(|n| arg == n))
 }
 
 fn ensure_tool_for_download() -> Result<()> {

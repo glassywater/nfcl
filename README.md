@@ -207,17 +207,28 @@ are untouched.
 ### config
 
 ```sh
-fontctl config                     # print every resolved path + proxy
-fontctl config 127.0.0.1:7890      # persist a download proxy
-fontctl config http://10.0.0.5:3128
-fontctl config none                # clear the persisted proxy
-                                   # (also accepts off / - / clear / "")
+fontctl config                              # print every resolved path + proxy
+fontctl config proxy 127.0.0.1:7890         # write "proxy": "127.0.0.1:7890"
+fontctl config proxy http://10.0.0.5:3128
+fontctl config proxy none                   # remove the proxy key
+                                            # (also accepts off / - / clear / "")
+
+# The form is generic — any key/value pair lands in config.json:
+fontctl config editor neovim                # writes "editor": "neovim"
+fontctl config editor none                  # removes it
 ```
 
-The proxy is read by `install` (and any path that calls `download_payload`)
-and threaded into `curl -x …` or, when only `wget` is available, into the
-`http_proxy` / `https_proxy` env vars. Bare `host:port` is fine; a missing
-scheme is auto-prefixed with `http://` for `wget`.
+`config` is just a typed editor for `~/.config/fontctl/config.json`. fontctl
+itself acts on a few known keys (`proxy`, `repo_dir`, `cache_dir`); anything
+else you set is round-tripped verbatim — kept on disk for your own scripts
+or future fontctl versions, never silently dropped by the next `init`.
+
+`version` and `remote` are managed by fontctl and refuse manual writes.
+
+The `proxy` value is read by `install` (and anything else that calls
+`download_payload`) and threaded into `curl -x …` or, when only `wget` is
+available, into the `http_proxy` / `https_proxy` env vars. Bare `host:port`
+is fine; a missing scheme is auto-prefixed with `http://` for `wget`.
 
 Resolution order: the env var **`FONTCTL_PROXY`** wins, otherwise the value
 persisted in `config.json` is used. So you can do an ad-hoc one-off install

@@ -308,7 +308,7 @@ Usage:
 
 Commands:
   init, --init              Initialize config and choose git repo path
-  list [--installed]        List bucket fonts or installed fonts
+  list [--all]              List installed fonts (use --all to dump the full bucket)
   search <query>            Search bucket manifests
   info <font>               Show manifest details
   install <font> [--force]  Download, verify, extract, and install a font
@@ -499,7 +499,13 @@ fn prompt_repo_path(default_repo: &Path) -> Result<PathBuf> {
 }
 
 fn cmd_list(options: &Options, args: &[String]) -> Result<()> {
-    if args.iter().any(|arg| arg == "--installed") {
+    // Default view is "what did I install" — that's what feels right for a
+    // package manager prompt. `--all` (or `-a`) opts into the full manifest
+    // catalog with `*` markers for already-installed fonts. We deliberately
+    // don't accept `--bucket`/`--installed` here because both are taken as
+    // global path overrides by parse_global_args.
+    let want_bucket = args.iter().any(|arg| arg == "--all" || arg == "-a");
+    if !want_bucket {
         return cmd_installed(options);
     }
 

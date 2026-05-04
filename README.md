@@ -8,6 +8,7 @@ Linux font manager backed by Scoop manifests from
 ```sh
 cargo run -- --init
 cargo run -- list
+cargo run -- list --all
 cargo run -- search firacode
 cargo run -- info firecode
 cargo run -- install firecode

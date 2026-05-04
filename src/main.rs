@@ -60,11 +60,13 @@ struct Options {
     bucket_cache_path: PathBuf,
     font_root: PathBuf,
     cache_dir: PathBuf,
+    proxy: Option<String>,
     repo_overridden: bool,
     bucket_overridden: bool,
     installed_overridden: bool,
     bucket_cache_overridden: bool,
     cache_dir_overridden: bool,
+    proxy_overridden: bool,
 }
 
 impl Options {
@@ -110,6 +112,12 @@ impl Options {
                 .unwrap_or_else(|| home_dir().join(".cache"))
                 .join(APP_NAME)
         });
+        let proxy_env = env::var("FONTCTL_PROXY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let proxy_overridden = proxy_env.is_some();
+        let proxy = proxy_env;
 
         Ok(Self {
             repo_dir,
@@ -119,11 +127,13 @@ impl Options {
             bucket_cache_path,
             font_root,
             cache_dir,
+            proxy,
             repo_overridden,
             bucket_overridden,
             installed_overridden,
             bucket_cache_overridden,
             cache_dir_overridden,
+            proxy_overridden,
         })
     }
 }
@@ -181,7 +191,7 @@ fn run() -> Result<()> {
         "uninstall" | "remove" | "rm" => cmd_uninstall(&options, &args[1..])?,
         "installed" => cmd_installed(&options)?,
         "update" | "pudate" => cmd_update(&mut options, &args[1..])?,
-        "config" => cmd_config(&options)?,
+        "config" => cmd_config(&mut options, &args[1..])?,
         "doctor" => cmd_doctor(&options)?,
         "cache" => cmd_cache(&options, &args[1..])?,
         command => {
@@ -307,7 +317,9 @@ Commands:
   update [--install]        git pull/clone manifests, then compare installed versions
   cache list                List archives kept in the download cache
   cache rm <font>|--all     Drop a single cached archive or wipe the whole cache
-  config                    Print paths used by the CLI
+  config [<proxy>]          Print settings, or persist a download proxy
+                            (e.g. `{APP_NAME} config 127.0.0.1:7890`,
+                             `{APP_NAME} config none` to clear)
   doctor                    Check local tools and paths
 
 Global options:
@@ -345,6 +357,16 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
             options.cache_dir = expand_home(saved);
         }
     }
+    // Same idea for proxy: env var FONTCTL_PROXY wins, otherwise we reuse
+    // whatever was previously persisted.
+    if !options.proxy_overridden {
+        options.proxy = config
+            .proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
 
     let installed_to_create = if options.installed_path.exists() {
         None
@@ -373,6 +395,7 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
 
     config.repo_dir = Some(options.repo_dir.to_string_lossy().to_string());
     config.cache_dir = Some(options.cache_dir.to_string_lossy().to_string());
+    config.proxy = options.proxy.clone();
     save_config(&options.config_path, &config)?;
     if let Some(mut installed) = installed_to_create {
         installed.version = repo_version_or_unknown(&options.repo_dir);
@@ -435,6 +458,14 @@ fn ensure_initialized(options: &mut Options) -> Result<()> {
         {
             options.cache_dir = expand_home(cache);
         }
+    }
+    if !options.proxy_overridden {
+        options.proxy = config
+            .proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
     }
 
     // Lazy migration: if the on-disk config predates the cache_dir field,
@@ -812,7 +843,38 @@ fn cmd_update(options: &mut Options, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_config(options: &Options) -> Result<()> {
+fn cmd_config(options: &mut Options, args: &[String]) -> Result<()> {
+    // `fontctl config` (no args)             -> print current settings
+    // `fontctl config <host:port|url>`       -> persist proxy = <value>
+    // `fontctl config none|off|-|""`         -> clear the persisted proxy
+    if !args.is_empty() {
+        if args.len() > 1 {
+            return bail("config takes at most one argument: the proxy value (or 'none' to clear)");
+        }
+        let raw = args[0].trim();
+        let mut on_disk = load_config(&options.config_path)?;
+        let new_proxy: Option<String> = match raw {
+            "" | "none" | "off" | "-" | "clear" => None,
+            other => Some(other.to_string()),
+        };
+        on_disk.proxy = new_proxy.clone();
+        // repo_dir/cache_dir come from current Options so save_config doesn't
+        // overwrite them with stale on-disk values it just loaded back.
+        on_disk.repo_dir = Some(options.repo_dir.to_string_lossy().to_string());
+        on_disk.cache_dir = Some(options.cache_dir.to_string_lossy().to_string());
+        save_config(&options.config_path, &on_disk)?;
+        // Reflect the change in this process's Options too — useful if another
+        // command (e.g. install) is chained later in scripts.
+        if !options.proxy_overridden {
+            options.proxy = new_proxy.clone();
+        }
+        match new_proxy {
+            Some(value) => println!("proxy = {value}"),
+            None => println!("proxy cleared"),
+        }
+        return Ok(());
+    }
+
     println!("Repo:         {}", options.repo_dir.display());
     println!("Bucket:       {}", options.bucket_dir.display());
     println!("Config:       {}", options.config_path.display());
@@ -820,6 +882,10 @@ fn cmd_config(options: &Options) -> Result<()> {
     println!("Bucket cache: {}", options.bucket_cache_path.display());
     println!("Fonts:        {}", options.font_root.display());
     println!("Cache:        {}", options.cache_dir.display());
+    println!(
+        "Proxy:        {}",
+        options.proxy.as_deref().unwrap_or("(none)")
+    );
     println!("Remote:       {DEFAULT_REMOTE}");
     Ok(())
 }
@@ -1374,6 +1440,8 @@ struct CliConfig {
     repo_dir: Option<String>,
     #[serde(default)]
     cache_dir: Option<String>,
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1499,6 +1567,7 @@ fn load_config(path: &Path) -> Result<CliConfig> {
         return Ok(CliConfig {
             repo_dir: None,
             cache_dir: None,
+            proxy: None,
         });
     }
     let text = fs::read_to_string(path)?;
@@ -1530,6 +1599,12 @@ fn save_config(path: &Path, config: &CliConfig) -> Result<()> {
         value.insert(
             "cache_dir".to_string(),
             serde_json::Value::String(cache_dir.to_string()),
+        );
+    }
+    if let Some(proxy) = config.proxy.as_deref().filter(|s| !s.is_empty()) {
+        value.insert(
+            "proxy".to_string(),
+            serde_json::Value::String(proxy.to_string()),
         );
     }
     let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(value))
@@ -1699,7 +1774,7 @@ fn install_manifest(options: &Options, manifest: &Manifest, force: bool) -> Resu
             if payload_path.exists() {
                 fs::remove_file(&payload_path)?;
             }
-            download_payload(url, &payload_path)?;
+            download_payload(url, &payload_path, options.proxy.as_deref())?;
             if let Some(hash) = expected {
                 verify_sha256(&payload_path, hash)?;
             }
@@ -1907,23 +1982,34 @@ fn unpack_payload(payload: &Path, target: &Path, original_filename: &str) -> Res
     Ok(())
 }
 
-fn download_payload(url: &str, target: &Path) -> Result<()> {
+fn download_payload(url: &str, target: &Path, proxy: Option<&str>) -> Result<()> {
     let clean_url = download_url(url);
     if command_exists("curl") {
-        run_command(
-            Command::new("curl")
-                .arg("-L")
-                .arg("--fail")
-                .arg("--output")
-                .arg(target)
-                .arg(clean_url),
-            "curl download",
-        )
+        let mut cmd = Command::new("curl");
+        cmd.arg("-L").arg("--fail");
+        if let Some(p) = proxy {
+            // curl accepts host:port without a scheme and assumes HTTP.
+            cmd.arg("-x").arg(p);
+        }
+        cmd.arg("--output").arg(target).arg(clean_url);
+        run_command(&mut cmd, "curl download")
     } else if command_exists("wget") {
-        run_command(
-            Command::new("wget").arg("-O").arg(target).arg(clean_url),
-            "wget download",
-        )
+        let mut cmd = Command::new("wget");
+        if let Some(p) = proxy {
+            // wget needs full URLs in its proxy env vars; add a scheme if the
+            // user only typed host:port.
+            let normalized = if p.contains("://") {
+                p.to_string()
+            } else {
+                format!("http://{p}")
+            };
+            cmd.env("http_proxy", &normalized)
+                .env("https_proxy", &normalized)
+                .arg("-e")
+                .arg("use_proxy=yes");
+        }
+        cmd.arg("-O").arg(target).arg(clean_url);
+        run_command(&mut cmd, "wget download")
     } else {
         bail("missing downloader: install curl or wget")
     }

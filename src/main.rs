@@ -404,12 +404,30 @@ fn cmd_init(options: &mut Options, args: &[String]) -> Result<()> {
     }
     let cache_built = refresh_bucket_cache(options)?;
 
+    // Adopt any font directories that exist on disk but aren't recorded in
+    // installed.json — typical after a re-init / dotfile sync where the
+    // ~/.local/share/fonts/fontctl/ tree survived but installed.json didn't.
+    // Keys already present in installed.json are left untouched.
+    let mut installed_now = load_installed(&options.installed_path)?;
+    let adopted = adopt_existing_fonts(options, &mut installed_now)?;
+    if !adopted.is_empty() {
+        save_installed(&options.installed_path, &installed_now)?;
+    }
+
     println!("Initialized {APP_NAME}.");
     println!("Config:         {}", options.config_path.display());
     println!("Installed JSON: {}", options.installed_path.display());
     println!("Bucket cache:   {}", options.bucket_cache_path.display());
     println!("Repo:           {}", options.repo_dir.display());
     println!("Cache dir:      {}", options.cache_dir.display());
+    if !adopted.is_empty() {
+        println!(
+            "Adopted {} existing font dir{}: {}",
+            adopted.len(),
+            if adopted.len() == 1 { "" } else { "s" },
+            adopted.join(", ")
+        );
+    }
     if !cache_built {
         println!(
             "Bucket directory not found yet; run '{APP_NAME} update' to clone the repo and build the bucket cache."
@@ -1768,6 +1786,102 @@ fn build_and_save_bucket_cache(options: &Options) -> Result<BucketCache> {
     let cache = build_bucket_cache(&options.bucket_dir, &options.repo_dir)?;
     save_bucket_cache(&options.bucket_cache_path, &cache)?;
     Ok(cache)
+}
+
+/// Reconcile font_root with installed.json: any subdirectory whose name maps
+/// 1-to-1 to a bucket manifest gets adopted as an installed entry. Adopting
+/// only writes new keys — entries already present in `config.installed` are
+/// left untouched (their stored version/install time/etc. are presumed more
+/// trustworthy than anything we can recover from disk). Directories whose
+/// name doesn't match any manifest are reported but never deleted.
+///
+/// Caller is responsible for `save_installed` if the returned list is
+/// non-empty.
+fn adopt_existing_fonts(
+    options: &Options,
+    config: &mut InstalledFile,
+) -> Result<Vec<String>> {
+    if !options.font_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let index = match load_bucket_index(&options.bucket_dir) {
+        Ok(idx) => idx,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut by_name: BTreeMap<&str, &BucketEntry> = BTreeMap::new();
+    for entry in &index.entries {
+        by_name.insert(entry.name.as_str(), entry);
+    }
+
+    let mut adopted = Vec::new();
+    let mut orphans = Vec::new();
+
+    for entry in fs::read_dir(&options.font_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if config.installed.contains_key(&name) {
+            continue;
+        }
+        let bucket_entry = match by_name.get(name.as_str()) {
+            Some(e) => *e,
+            None => {
+                orphans.push(name);
+                continue;
+            }
+        };
+        let manifest = read_manifest(&bucket_entry.path)?;
+        let mut files = Vec::new();
+        collect_font_files(&path, &mut files)?;
+        if files.is_empty() {
+            continue;
+        }
+        let installed_at = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(now_unix_seconds);
+        let record = InstalledFont {
+            name: manifest.name.clone(),
+            version: manifest.version_text(),
+            manifest: manifest.path.to_string_lossy().to_string(),
+            urls: manifest.urls.clone(),
+            hashes: manifest
+                .hashes
+                .iter()
+                .map(|value| value.clone().unwrap_or_default())
+                .collect(),
+            installed_at,
+            font_dir: path.to_string_lossy().to_string(),
+            files: files
+                .into_iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
+        };
+        config.installed.insert(manifest.name.clone(), record);
+        adopted.push(manifest.name);
+    }
+
+    if !orphans.is_empty() {
+        eprintln!(
+            "warning: {} font dir{} have no matching manifest and were not adopted: {}",
+            orphans.len(),
+            if orphans.len() == 1 { "" } else { "s" },
+            orphans.join(", ")
+        );
+    }
+
+    adopted.sort();
+    Ok(adopted)
 }
 
 fn install_by_query(options: &Options, query: &str, force: bool) -> Result<InstalledFont> {

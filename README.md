@@ -51,6 +51,25 @@ This writes:
 If the chosen `repo_dir` doesn't exist yet, `fontctl update` will clone it on
 demand.
 
+### Re-init / adoption
+
+If `~/.local/share/fonts/fontctl/<name>/` directories already exist on disk
+when you run `--init` (typical after copying dotfiles to a new machine, or
+after deleting `installed.json` by accident), `fontctl` will scan that tree
+and adopt every directory whose name matches a manifest in the bucket:
+
+- A new entry is added to `installed.json` with the manifest's current
+  version, the directory's mtime as `installed_at`, and the actual font files
+  on disk.
+- Entries already present in `installed.json` are left **untouched** — their
+  recorded version / install time are presumed more accurate than anything
+  we can recover from disk.
+- Directories whose name doesn't match any manifest are reported as a
+  warning and never deleted.
+
+After that, `fontctl update` will compare those adopted versions against the
+bucket and report `OUTDATED` as usual.
+
 ## Commands
 
 ### list
